@@ -60,6 +60,7 @@ storage/chunked_docs/
 storage/images/
 storage/extracted_docs/
 storage/uploaded_pdfs/
+storage/documents/
 
 # ==============================
 # Local Vector / Database Files
