@@ -1,0 +1,29 @@
+[
+    {
+        "page_number": 1,
+        "character_count": 1806,
+        "images": []
+    },
+    {
+        "page_number": 2,
+        "character_count": 1323,
+        "images": [
+            "storage\\documents\\CC_test_32130f43\\images\\image_1.png"
+        ]
+    },
+    {
+        "page_number": 3,
+        "character_count": 2695,
+        "images": []
+    },
+    {
+        "page_number": 4,
+        "character_count": 2744,
+        "images": []
+    },
+    {
+        "page_number": 5,
+        "character_count": 2667,
+        "images": []
+    }
+]
