@@ -16,7 +16,7 @@ api_key = os.getenv("GROQ_API_KEY")
 
 if not api_key:
 
-    print("❌ GROQ API KEY NOT FOUND")
+    print("[ERROR] GROQ API KEY NOT FOUND")
 
 
 # ==================================================
@@ -32,7 +32,7 @@ client = Groq(
 # MODEL CONFIGURATION
 # ==================================================
 
-MODEL_NAME = "qwen/qwen3.6-27b"
+MODEL_NAME = "qwen/qwen3.8-27b"
 
 # Maximum number of tokens generated for the final answer
 MAX_COMPLETION_TOKENS = 1000
@@ -181,7 +181,7 @@ def generate_answer(
                 if not image_path:
 
                     print(
-                        "⚠️ Empty image path skipped."
+                        "[WARN] Empty image path skipped."
                     )
 
                     continue
@@ -203,7 +203,7 @@ def generate_answer(
                 if not path.exists():
 
                     print(
-                        f"❌ Image does not exist: {image_path}"
+                        f"[ERROR] Image does not exist: {image_path}"
                     )
 
                     continue
@@ -249,7 +249,7 @@ def generate_answer(
                 # --------------------------------------------------
 
                 print(
-                    f"✅ EXACT IMAGE: {image_path}"
+                    f"[OK] EXACT IMAGE: {image_path}"
                 )
 
                 print(
@@ -377,7 +377,7 @@ def generate_answer(
         if not response.choices:
 
             print(
-                "❌ Qwen returned no choices."
+                "[ERROR] Qwen returned no choices."
             )
 
             return (
@@ -392,9 +392,14 @@ def generate_answer(
         message = response.choices[0].message
 
 
-        print(
-            f"Message object: {message}"
-        )
+        try:
+            print(
+                f"Message object: {message}"
+            )
+        except UnicodeEncodeError:
+            print(
+                f"Message object: {ascii(str(message))}"
+            )
 
 
         # --------------------------------------------------
@@ -421,7 +426,7 @@ def generate_answer(
         if not answer:
 
             print(
-                "⚠️ Qwen returned empty content."
+                "[WARN] Qwen returned empty content."
             )
 
 
@@ -439,7 +444,7 @@ def generate_answer(
             if reasoning:
 
                 print(
-                    "⚠️ Reasoning was returned "
+                    "[WARN] Reasoning was returned "
                     "but final content was empty."
                 )
 
@@ -484,7 +489,7 @@ def generate_answer(
         if not answer:
 
             print(
-                "⚠️ Answer became empty after "
+                "[WARN] Answer became empty after "
                 "removing thinking content."
             )
 
@@ -536,7 +541,7 @@ def generate_answer(
 
             print("\n")
             print("=" * 60)
-            print("❌ GROQ API KEY ERROR")
+            print("[ERROR] GROQ API KEY ERROR")
             print("=" * 60)
 
             print(
@@ -571,7 +576,7 @@ def generate_answer(
 
             print("\n")
             print("=" * 60)
-            print("❌ GROQ RATE LIMIT / TOKEN ERROR")
+            print("[ERROR] GROQ RATE LIMIT / TOKEN ERROR")
             print("=" * 60)
 
             print(
@@ -595,7 +600,7 @@ def generate_answer(
 
         print("\n")
         print("=" * 60)
-        print("❌ GROQ API ERROR")
+        print("[ERROR] GROQ API ERROR")
         print("=" * 60)
 
         print(

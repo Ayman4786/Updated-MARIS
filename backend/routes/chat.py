@@ -2,6 +2,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from pathlib import Path
+import json
+import re
 
 from ai.rag.chunk_storage import load_chunks
 from ai.rag.embeddings_service import EmbeddingsService
@@ -26,19 +28,20 @@ class QuestionRequest(BaseModel):
     question: str
 
     # --------------------------------------------------
-    # OPTIONAL
+    # Optional document ID
     #
-    # Normally user does NOT need to provide this.
+    # If provided:
+    # search only that document.
     #
-    # If provided, search only that document.
-    # If omitted, search ALL uploaded documents.
+    # If omitted:
+    # search all uploaded documents.
     # --------------------------------------------------
 
     document_id: str | None = None
 
 
 # ==================================================
-# DETECT EXPLICIT VISUAL QUESTIONS
+# DETECT VISUAL / DIAGRAM QUESTIONS
 # ==================================================
 
 def requires_explicit_vision(
@@ -51,7 +54,15 @@ def requires_explicit_vision(
         .strip()
     )
 
+    # ==================================================
+    # 1. DIRECT VISUAL PHRASES
+    # ==================================================
+
     visual_phrases = [
+
+        # --------------------------------------------------
+        # Figures / diagrams / images
+        # --------------------------------------------------
 
         "explain the figure",
         "explain the diagram",
@@ -94,16 +105,107 @@ def requires_explicit_vision(
         "look at the chart",
         "look at the graph",
 
+        # --------------------------------------------------
+        # Architecture
+        # --------------------------------------------------
+
+        "system architecture",
+        "system architecture diagram",
+        "architecture diagram",
+        "architecture of the system",
+        "explain the architecture",
+        "explain system architecture",
+        "explain the system architecture",
+        "describe the architecture",
+        "describe system architecture",
+        "describe the system architecture",
+
+        # --------------------------------------------------
+        # Workflow / pipeline
+        # --------------------------------------------------
+
+        "workflow diagram",
+        "system workflow",
+        "system workflow diagram",
+        "explain the workflow",
+        "describe the workflow",
+
+        "pipeline diagram",
+        "system pipeline",
+        "explain the pipeline",
+        "describe the pipeline",
+
+        # --------------------------------------------------
+        # Block / flow diagrams
+        # --------------------------------------------------
+
+        "block diagram",
+        "block diagram of the system",
+        "explain the block diagram",
+        "describe the block diagram",
+
+        "flow diagram",
+        "flow chart",
+        "flowchart",
+        "explain the flow chart",
+        "explain the flowchart",
+        "describe the flow chart",
+        "describe the flowchart",
+
+        # --------------------------------------------------
+        # Visual representation
+        # --------------------------------------------------
+
         "visual representation",
-        "what does it look like"
+        "visual representation of the system",
+        "visual representation of the architecture",
+
+        "what does it look like",
+        "what is represented in the diagram",
+        "what is represented in the figure",
+        "what is represented in the architecture",
+
+        # --------------------------------------------------
+        # Components shown visually
+        # --------------------------------------------------
+
+        "components in the diagram",
+        "components shown in the diagram",
+        "components of the architecture",
+        "components shown in the architecture",
+
+        "explain the components in the diagram",
+        "explain the components of the architecture",
+
+        # --------------------------------------------------
+        # Connections / relationships
+        # --------------------------------------------------
+
+        "how are the components connected",
+        "how are the components connected in the diagram",
+        "how does the architecture work",
+        "how does the system architecture work",
 
     ]
+
+    # ==================================================
+    # CHECK DIRECT PHRASES
+    # ==================================================
 
     for phrase in visual_phrases:
 
         if phrase in question:
 
+            print(
+                f"[OK] Visual intent detected "
+                f"through phrase: '{phrase}'"
+            )
+
             return True
+
+    # ==================================================
+    # 2. VISUAL OBJECT KEYWORDS
+    # ==================================================
 
     visual_objects = [
 
@@ -114,9 +216,25 @@ def requires_explicit_vision(
         "chart",
         "graph",
         "table",
-        "illustration"
+        "illustration",
+
+        # Architecture-related
+        "architecture",
+
+        # Workflow-related
+        "workflow",
+        "pipeline",
+
+        # Diagram-related
+        "flowchart",
+        "flow",
+        "block diagram"
 
     ]
+
+    # ==================================================
+    # 3. VISUAL ACTION KEYWORDS
+    # ==================================================
 
     visual_actions = [
 
@@ -125,11 +243,17 @@ def requires_explicit_vision(
         "show",
         "identify",
         "analyze",
+        "analyse",
         "interpret",
         "contain",
-        "represent"
+        "represent",
+        "illustrate"
 
     ]
+
+    # ==================================================
+    # CHECK OBJECT + ACTION
+    # ==================================================
 
     has_visual_object = any(
         word in question
@@ -141,21 +265,115 @@ def requires_explicit_vision(
         for word in visual_actions
     )
 
-    return (
+    if (
         has_visual_object
         and has_visual_action
+    ):
+
+        print(
+            "[OK] Visual intent detected "
+            "through object + action keywords."
+        )
+
+        return True
+
+    # ==================================================
+    # NO VISUAL INTENT
+    # ==================================================
+
+    print(
+        "[INFO] No explicit visual intent detected."
     )
+
+    return False
 
 
 # ==================================================
-# GET IMAGES FROM RETRIEVED CHUNKS
+# ==================================================
+# CENTRALIZED VISUAL-NOISE FILTER THRESHOLDS
+# ==================================================
+
+MIN_DIAGRAM_WIDTH = 80.0    # points / pixels
+MIN_DIAGRAM_HEIGHT = 80.0   # points / pixels
+MIN_DIAGRAM_AREA = 10000.0  # width * height points / pixels
+
+
+# ==================================================
+# IDENTIFY MOST RELEVANT PAGES FOR VISUAL QUESTIONS
+# ==================================================
+
+def identify_most_relevant_pages(
+    retrieved_chunks: list[dict],
+    question: str = ""
+) -> list[tuple[str, int]]:
+    """
+    Ranks (document_id, page_number) pairs from retrieved chunks by combining:
+    - Text retrieval score
+    - Visual query keyword overlap in chunk text (e.g. process, flow, diagram)
+    - Direct presence of attached images in the chunk
+    """
+    page_scores = {}
+    q_words = [
+        w for w in re.findall(r'\w+', question.lower())
+        if len(w) > 3
+    ] if question else []
+
+    for chunk in retrieved_chunks:
+        metadata = chunk.get("metadata", {}) or {}
+        page_num = metadata.get("page_number") or metadata.get("page")
+        doc_id = metadata.get("document_id")
+
+        if not page_num or not doc_id:
+            continue
+
+        pair = (str(doc_id), int(page_num))
+        chunk_score = float(chunk.get("score", 0.0) or 0.0)
+        chunk_text = str(chunk.get("text", "")).lower()
+
+        # Keyword overlap bonus
+        overlap = sum(1 for w in q_words if w in chunk_text) if q_words else 0
+
+        # Direct visual presence bonus
+        has_images = bool(metadata.get("image_paths") or metadata.get("image_path"))
+        visual_factor = 2.0 if has_images else 0.5
+
+        page_scores[pair] = (
+            page_scores.get(pair, 0.0)
+            + (chunk_score + (0.25 * overlap)) * visual_factor
+        )
+
+    # Sort descending by score
+    sorted_pages = sorted(
+        page_scores.keys(),
+        key=lambda p: page_scores[p],
+        reverse=True
+    )
+    return sorted_pages
+
+
+# ==================================================
+# GET IMAGE CANDIDATES FROM RETRIEVED CHUNKS & PAGES
 # ==================================================
 
 def get_retrieved_images(
-    retrieved_chunks: list[dict]
+    retrieved_chunks: list[dict],
+    question: str = "",
+    documents_root: Path = Path("storage/documents"),
+    include_page_images: bool = True,
+    max_page_coverage: int = 1
 ) -> list[str]:
+    """
+    Collects candidate image paths from retrieved chunks and their parent pages.
+    Supports in priority order:
+    1. metadata['image_paths'] (native list)
+    2. metadata['image_paths_json'] (json string)
+    3. legacy metadata['image_path'] (string)
 
+    If include_page_images is True, also discovers all images belonging to the
+    most relevant parent pages (top max_page_coverage pages) via pages.json.
+    """
     image_paths = []
+    seen_paths = set()
 
     for chunk in retrieved_chunks:
 
@@ -164,40 +382,134 @@ def get_retrieved_images(
                 "metadata",
                 {}
             )
+            or {}
         )
 
-        image_path = (
-            metadata.get(
-                "image_path"
-            )
+        chunk_images = []
+
+        # 1. image_paths (native list)
+        if "image_paths" in metadata and isinstance(metadata["image_paths"], list):
+            chunk_images = metadata["image_paths"]
+
+        # 2. image_paths_json (json serialized string)
+        elif "image_paths_json" in metadata and isinstance(metadata["image_paths_json"], str):
+            try:
+                parsed = json.loads(metadata["image_paths_json"])
+                if isinstance(parsed, list):
+                    chunk_images = parsed
+            except Exception:
+                pass
+
+        # 3. legacy image_path (string)
+        elif "image_path" in metadata and metadata["image_path"]:
+            chunk_images = [metadata["image_path"]]
+
+        for img in chunk_images:
+            if not img:
+                continue
+            norm_path = str(Path(img))
+            if norm_path not in seen_paths and Path(norm_path).exists():
+                seen_paths.add(norm_path)
+                image_paths.append(norm_path)
+
+    # Also discover images belonging to the top relevant parent pages
+    if include_page_images and retrieved_chunks:
+        relevant_pages = identify_most_relevant_pages(
+            retrieved_chunks=retrieved_chunks,
+            question=question
         )
-
-        if not image_path:
-
-            continue
-
-        image_path = str(
-            Path(image_path)
-        )
-
-        if not Path(
-            image_path
-        ).exists():
-
-            print(
-                "❌ Retrieved image "
-                f"does not exist: {image_path}"
-            )
-
-            continue
-
-        if image_path not in image_paths:
-
-            image_paths.append(
-                image_path
-            )
+        for doc_id, page_num in relevant_pages[:max_page_coverage]:
+            pages_file = documents_root / doc_id / "pages.json"
+            if pages_file.exists():
+                try:
+                    with open(pages_file, "r", encoding="utf-8") as f:
+                        pages_data = json.load(f)
+                    for page_entry in pages_data:
+                        if page_entry.get("page_number") == page_num:
+                            for p_img in page_entry.get("images", []):
+                                norm_p = str(Path(p_img))
+                                if norm_p not in seen_paths and Path(norm_p).exists():
+                                    seen_paths.add(norm_p)
+                                    image_paths.append(norm_p)
+                except Exception as err:
+                    print(
+                        f"Error loading page images for {doc_id} page {page_num}: {err}"
+                    )
 
     return image_paths
+
+
+# ==================================================
+# FILTER VISUAL NOISE (SMALL ICONS / LOGOS)
+# ==================================================
+
+def filter_visual_noise(
+    candidate_paths: list[str],
+    document_id: str | None,
+    documents_root: Path = Path("storage/documents")
+) -> list[str]:
+    """
+    Conservative visual-noise filter.
+    Prefers sufficiently large diagram/figure candidates.
+    Penalizes or excludes clearly tiny icon/logo candidates when larger valid visual
+    candidates exist.
+    If no larger candidates exist, all candidates are preserved.
+    """
+    if not candidate_paths or not document_id:
+        return candidate_paths
+
+    manifest_path = documents_root / document_id / "visual_manifest.json"
+    manifest_by_path = {}
+
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            for v in manifest_data:
+                ip = v.get("image_path")
+                if ip:
+                    manifest_by_path[Path(ip).as_posix().lower()] = v
+                    manifest_by_path[Path(ip).name.lower()] = v
+        except Exception as e:
+            print(f"Warning: could not load visual_manifest for noise filter: {e}")
+
+    large_candidates = []
+    small_candidates = []
+
+    for path_str in candidate_paths:
+        p = Path(path_str)
+        visual = manifest_by_path.get(p.as_posix().lower()) or manifest_by_path.get(p.name.lower())
+        w, h, area = 0.0, 0.0, 0.0
+
+        if visual and "bbox" in visual:
+            bbox = visual["bbox"]
+            w = abs(bbox.get("r", 0) - bbox.get("l", 0))
+            h = abs(bbox.get("t", 0) - bbox.get("b", 0))
+            area = w * h
+        elif p.exists():
+            try:
+                from PIL import Image
+                with Image.open(p) as img:
+                    w, h = img.size
+                    area = w * h
+            except Exception:
+                pass
+
+        if (w >= MIN_DIAGRAM_WIDTH and h >= MIN_DIAGRAM_HEIGHT) or area >= MIN_DIAGRAM_AREA:
+            large_candidates.append(path_str)
+        else:
+            small_candidates.append(path_str)
+
+    # Prefer larger diagram/figure candidates if available
+    if large_candidates:
+        print(
+            f"Visual noise filter: selected {len(large_candidates)} diagrams, "
+            f"filtered {len(small_candidates)} small icons"
+        )
+        return large_candidates
+    else:
+        # If no large candidates exist, retain all candidates
+        return candidate_paths
 
 
 # ==================================================
@@ -236,7 +548,7 @@ def load_all_documents(
         if not chunks_path.exists():
 
             print(
-                f"⚠️ Skipping {path.name} "
+                f"[WARN] Skipping {path.name} "
                 "because chunks.json is missing."
             )
 
@@ -249,7 +561,7 @@ def load_all_documents(
             )
 
             print(
-                f"✅ Loaded "
+                f"[OK] Loaded "
                 f"{len(chunks)} chunks "
                 f"from {path.name}"
             )
@@ -298,13 +610,145 @@ def load_all_documents(
         except Exception as e:
 
             print(
-                f"❌ Failed loading "
+                f"[ERROR] Failed loading "
                 f"{path.name}: {e}"
             )
 
     return (
         all_chunks,
         document_dirs
+    )
+
+
+# ==================================================
+# RANK IMAGE CANDIDATES USING VISUAL RAG
+# ==================================================
+
+def rank_visual_candidates(
+    question: str,
+    document_id: str | None,
+    candidate_images: list[str],
+    top_k: int = 1
+) -> tuple[list[str], list[dict]]:
+
+    if not candidate_images:
+
+        print(
+            "No image candidates available "
+            "for visual ranking."
+        )
+
+        return [], []
+
+    if not document_id:
+
+        print(
+            "[WARN] Visual ranking requires a "
+            "specific document_id."
+        )
+
+        return [], []
+
+    print("\n")
+    print("=" * 60)
+    print("VISUAL RAG RANKING (CANDIDATES ONLY)")
+    print("=" * 60)
+
+    print(
+        f"Candidate images to score: "
+        f"{len(candidate_images)}"
+    )
+
+    print(
+        f"Visual top_k: {top_k}"
+    )
+
+    try:
+
+        visual_rag = VisualRAG()
+
+        # Score ONLY the supplied candidate images directly
+        scored_candidates = (
+            visual_rag.score_candidates(
+                query=question,
+                candidate_paths=candidate_images,
+                document_id=document_id
+            )
+        )
+
+    except Exception as error:
+
+        print(
+            "[ERROR] Visual RAG candidate scoring failed:"
+        )
+
+        print(error)
+
+        return [], []
+
+    selected_paths = []
+    selected_results = []
+
+    for visual in scored_candidates:
+
+        image_path = (
+            visual.get(
+                "image_path"
+            )
+        )
+
+        if not image_path:
+            continue
+
+        image_path = str(
+            Path(image_path)
+        )
+
+        if (
+            image_path not in selected_paths
+            and Path(image_path).exists()
+        ):
+            selected_paths.append(
+                image_path
+            )
+
+            selected_results.append(
+                visual
+            )
+
+            if len(selected_paths) >= top_k:
+                break
+
+    # --------------------------------------------------
+    # Debug
+    # --------------------------------------------------
+
+    print("\n")
+    print(
+        f"Final selected visual(s): "
+        f"{len(selected_paths)}"
+    )
+
+    for visual in selected_results:
+
+        print(
+            f"[OK] Selected image: "
+            f"{visual.get('image_path')}"
+        )
+
+        print(
+            f"   Page: "
+            f"{visual.get('page_number')}"
+        )
+
+        print(
+            f"   Score: "
+            f"{visual.get('score'):.4f}"
+        )
+
+    return (
+        selected_paths,
+        selected_results
     )
 
 
@@ -384,7 +828,7 @@ async def chat(
     for directory in document_dirs:
 
         print(
-            f"📄 {directory.name}"
+            f"[DOC] {directory.name}"
         )
 
     print(
@@ -454,8 +898,10 @@ async def chat(
     )
 
     # ==================================================
-    # HYBRID RETRIEVAL
+    # TEXT RETRIEVAL
     # ==================================================
+
+    TEXT_TOP_K = 5
 
     retrieved_chunks = (
         retriever.retrieve(
@@ -466,14 +912,11 @@ async def chat(
             all_chunks=
                 all_chunks,
 
-            # --------------------------------------------------
-            # None = search ALL PDFs
-            # --------------------------------------------------
-
             document_id=
                 selected_document_id,
 
-            top_k=5
+            top_k=
+                TEXT_TOP_K
 
         )
     )
@@ -486,7 +929,7 @@ async def chat(
     if not retrieved_chunks:
 
         print(
-            "❌ No relevant chunks found."
+            "[WARN] No relevant chunks found."
         )
 
     for index, chunk in enumerate(
@@ -519,12 +962,20 @@ async def chat(
             f"{chunk.get('score')}"
         )
 
-        print(
-            chunk.get(
-                "text",
-                ""
-            )[:700]
-        )
+        try:
+            print(
+                chunk.get(
+                    "text",
+                    ""
+                )[:700]
+            )
+        except UnicodeEncodeError:
+            print(
+                chunk.get(
+                    "text",
+                    ""
+                )[:700].encode("ascii", errors="replace").decode("ascii")
+            )
 
         if metadata.get(
             "image_path"
@@ -540,7 +991,7 @@ async def chat(
         )
 
     # ==================================================
-    # BUILD CONTEXT
+    # BUILD TEXT CONTEXT
     # ==================================================
 
     context = (
@@ -550,17 +1001,7 @@ async def chat(
     )
 
     # ==================================================
-    # FIND RETRIEVED IMAGES
-    # ==================================================
-
-    retrieved_images = (
-        get_retrieved_images(
-            retrieved_chunks
-        )
-    )
-
-    # ==================================================
-    # DETERMINE VISION MODE
+    # DETERMINE VISUAL INTENT
     # ==================================================
 
     explicit_vision = (
@@ -569,80 +1010,133 @@ async def chat(
         )
     )
 
+    print("\n")
+    print("=" * 60)
+    print("VISUAL INTENT")
+    print("=" * 60)
+
+    print(
+        f"Visual intent detected: "
+        f"{explicit_vision}"
+    )
+
+    # ==================================================
+    # VISUAL RETRIEVAL & IMAGE GATING
+    # ==================================================
+
+    VISUAL_TOP_K = 3
     image_paths = []
     visual_results = []
+    candidate_images = []
 
     # --------------------------------------------------
-    # If relevant retrieved chunks have images,
-    # use those images automatically.
-    #
-    # This is NOT dependent on document ID.
+    # MANDATORY: Text-only questions MUST NEVER send images
     # --------------------------------------------------
 
-    if retrieved_images:
-
-        image_paths = retrieved_images
-
-    # --------------------------------------------------
-    # If user explicitly asks about a visual and
-    # retrieval didn't find one, use VisualRAG.
-    # --------------------------------------------------
-
-    elif explicit_vision:
+    if not explicit_vision:
 
         print("\n")
         print("=" * 60)
-        print("VISUAL RAG FALLBACK")
+        print("VISUAL RAG NOT TRIGGERED")
+        print("=" * 60)
+        print("[INFO] No explicit visual intent detected in question.")
+        print("[INFO] Text-only query: ZERO images will be sent to LLM.")
+
+    else:
+
+        print("\n")
+        print("=" * 60)
+        print("VISUAL INTENT DETECTED")
         print("=" * 60)
 
-        visual_rag = VisualRAG()
-
-        visual_results = (
-            visual_rag.retrieve(
-
-                query=
-                    request.question,
-
-                document_id=
-                    selected_document_id,
-
-                top_k=2
-
+        # Identify effective document ID from request or top retrieved chunk
+        effective_document_id = selected_document_id
+        if not effective_document_id and retrieved_chunks:
+            effective_document_id = (
+                retrieved_chunks[0]
+                .get("metadata", {})
+                .get("document_id")
             )
+
+        print(
+            f"Effective document ID for visual search: {effective_document_id}"
         )
 
-        for visual in visual_results:
+        # --------------------------------------------------
+        # Collect candidate images from retrieved chunks & parent pages
+        # --------------------------------------------------
 
-            image_path = (
-                visual.get(
-                    "image_path"
-                )
-            )
+        raw_candidates = get_retrieved_images(
+            retrieved_chunks=retrieved_chunks,
+            question=request.question,
+            documents_root=documents_root,
+            include_page_images=True,
+            max_page_coverage=1
+        )
 
-            if not image_path:
+        print(
+            f"Raw candidate image count: {len(raw_candidates)}"
+        )
 
-                continue
+        # --------------------------------------------------
+        # Apply conservative visual-noise filter
+        # --------------------------------------------------
 
-            image_path = str(
-                Path(image_path)
-            )
+        candidate_images = filter_visual_noise(
+            candidate_paths=raw_candidates,
+            document_id=effective_document_id,
+            documents_root=documents_root
+        )
 
-            if not Path(
-                image_path
-            ).exists():
+        print("\n" + "=" * 60)
+        print("FINAL FILTERED IMAGE CANDIDATES")
+        print("=" * 60)
+        print(f"Candidates to score: {len(candidate_images)}")
+        for img in candidate_images:
+            print(f"Candidate: {img}")
+
+        # --------------------------------------------------
+        # Score candidates with VisualRAG
+        # --------------------------------------------------
+
+        if effective_document_id:
+
+            if candidate_images:
 
                 print(
-                    f"❌ Missing image: "
-                    f"{image_path}"
+                    "Scoring page/chunk candidates using Visual RAG..."
                 )
 
-                continue
-
-            if image_path not in image_paths:
-
-                image_paths.append(
-                    image_path
+                (
+                    image_paths,
+                    visual_results
+                ) = rank_visual_candidates(
+                    question=request.question,
+                    document_id=effective_document_id,
+                    candidate_images=candidate_images,
+                    top_k=VISUAL_TOP_K
                 )
+
+            else:
+
+                print(
+                    "No candidate images found in retrieved text context. "
+                    "Falling back to complete document visual manifest."
+                )
+
+                try:
+                    visual_rag = VisualRAG()
+                    visual_results = visual_rag.retrieve(
+                        query=request.question,
+                        document_id=effective_document_id,
+                        top_k=VISUAL_TOP_K
+                    )
+                    for visual in visual_results:
+                        ip = visual.get("image_path")
+                        if ip and Path(ip).exists():
+                            image_paths.append(str(Path(ip)))
+                except Exception as error:
+                    print(f"[ERROR] Visual RAG fallback failed: {error}")
 
     # ==================================================
     # VISION LOG
@@ -650,7 +1144,7 @@ async def chat(
 
     print("\n")
     print("=" * 60)
-    print("VISION MODE")
+    print("FINAL VISION SELECTION")
     print("=" * 60)
 
     print(
@@ -659,7 +1153,117 @@ async def chat(
     )
 
     print(
-        f"Relevant images found: "
+        f"Candidate images: "
+        f"{len(candidate_images)}"
+    )
+
+    # ==================================================
+    # LAYER 3: VERIFIED VISUAL RANKING
+    # ==================================================
+
+    if explicit_vision and image_paths:
+        print("\n")
+        print("=" * 60)
+        print("LAYER 3: VERIFIED VISUAL RANKING")
+        print("=" * 60)
+
+        # Helper function for verification
+        def verify_visual_candidate(q: str, ip: str) -> dict:
+            prompt = f"""You are a strict visual verification system.
+The user's question is: "{q}"
+
+Evaluate if the attached image is semantically relevant to answering the question.
+Does it contain the specific diagram, chart, or architecture requested?
+If it's just a tiny decorative icon, a logo, or an unrelated screenshot, mark relevant as false.
+
+Respond STRICTLY with valid JSON only, no markdown, no backticks.
+{{
+    "relevant": true or false,
+    "confidence": 0.0 to 1.0,
+    "reason": "short explanation"
+}}"""
+            try:
+                ans = generate_answer(prompt, image_paths=[ip])
+                ans = str(ans).strip()
+                if ans.startswith("```json"): ans = ans[7:]
+                if ans.startswith("```"): ans = ans[3:]
+                if ans.endswith("```"): ans = ans[:-3]
+                
+                return json.loads(ans.strip())
+            except Exception as e:
+                print(f"[ERROR] Verification failed for {ip}: {e}")
+                return None
+
+        final_scores = []
+        for visual in visual_results:
+            ip = visual.get("image_path")
+            if not ip or not Path(ip).exists():
+                continue
+                
+            clip_score = visual.get("score", 0.0)
+            v_type = visual.get("type", "")
+            
+            print(f"\nVISUAL VERIFICATION")
+            print(f"Question: {request.question}")
+            print(f"Candidate: {ip}")
+            print(f"Type: {v_type}")
+            print(f"CLIP score: {clip_score:.4f}")
+            
+            verdict = verify_visual_candidate(request.question, ip)
+            
+            if not verdict:
+                print("[WARN] Verification fallback.")
+                verdict = {"verification_status": "failed"}
+            else:
+                verdict["verification_status"] = "success"
+                
+            status = verdict.get("verification_status", "failed")
+            relevant = verdict.get("relevant", False)
+            conf = verdict.get("confidence", 0.0)
+            reason = verdict.get("reason", "")
+            
+            print(f"Verification status: {status}")
+            print(f"Verification: relevant={relevant}")
+            print(f"Verification confidence: {conf}")
+            print(f"Reason: {reason}")
+            
+            final_score = clip_score
+            
+            if status == "success":
+                if relevant:
+                    final_score += 1.0 # Semantic relevance boost
+                    final_score += conf * 0.5 
+                    
+                    if v_type == "reconstructed_group":
+                        final_score += 0.1 # Modest structural preference / tie-breaker
+                else:
+                    final_score -= 1.0 # Penalty
+            # If failed, final_score == clip_score (no modifications)
+                
+            print(f"Final visual score: {final_score:.4f}")
+            
+            final_scores.append({
+                "image_path": ip,
+                "visual": visual,
+                "final_score": final_score,
+                "verdict": verdict
+            })
+            
+        if final_scores:
+            final_scores.sort(key=lambda x: x["final_score"], reverse=True)
+            best_candidate = final_scores[0]
+            
+            print("\nFINAL VISUAL SELECTION")
+            print(f"Selected: {best_candidate['image_path']}")
+            print(f"Type: {best_candidate['visual'].get('type', '')}")
+            print(f"Score: {best_candidate['final_score']:.4f}")
+            print(f"Verified: {best_candidate['verdict']}")
+            
+            image_paths = [best_candidate["image_path"]]
+            visual_results = [best_candidate["visual"]]
+            
+    print(
+        f"Images selected for Qwen: "
         f"{len(image_paths)}"
     )
 
@@ -683,14 +1287,14 @@ async def chat(
             if path.exists():
 
                 print(
-                    f"✅ EXACT IMAGE: "
+                    f"[OK] EXACT IMAGE: "
                     f"{path}"
                 )
 
             else:
 
                 print(
-                    f"❌ IMAGE MISSING: "
+                    f"[MISSING] IMAGE MISSING: "
                     f"{path}"
                 )
 
@@ -709,9 +1313,14 @@ async def chat(
     print("TEXT CONTEXT")
     print("=" * 60)
 
-    print(
-        context[:5000]
-    )
+    try:
+        print(
+            context[:5000]
+        )
+    except UnicodeEncodeError:
+        print(
+            context[:5000].encode("ascii", errors="replace").decode("ascii")
+        )
 
     # ==================================================
     # BUILD PROMPT
@@ -743,7 +1352,7 @@ async def chat(
 
         print(
             "Sending retrieved TEXT + "
-            "retrieved IMAGE(S) to Qwen."
+            "selected relevant IMAGE(S) to Qwen."
         )
 
     else:
@@ -818,13 +1427,6 @@ async def chat(
 
         "question":
             request.question,
-
-        # --------------------------------------------------
-        # If one document was explicitly selected,
-        # return it.
-        #
-        # Otherwise return "auto".
-        # --------------------------------------------------
 
         "document_id":
             selected_document_id

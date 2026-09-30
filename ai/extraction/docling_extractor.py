@@ -107,8 +107,16 @@ def extract_text(pdf_path, output_dir):
 
     image_count = 0
     saved_count = 0
+    duplicate_count = 0
 
     visual_elements = []
+    
+    import hashlib
+    import io
+
+    # Maps for deduplication
+    seen_hashes = {}
+    canonical_visuals = {}
 
     # Map:
     #
@@ -156,21 +164,6 @@ def extract_text(pdf_path, output_dir):
                 continue
 
             # --------------------------------------------------
-            # Save image
-            # --------------------------------------------------
-
-            image.save(
-                image_path
-            )
-
-            saved_count += 1
-
-            print(
-                f"Image saved: "
-                f"{image_path}"
-            )
-
-            # --------------------------------------------------
             # Extract page + bounding box
             # --------------------------------------------------
 
@@ -194,6 +187,60 @@ def extract_text(pdf_path, output_dir):
                         bbox.coord_origin
                     )
                 }
+
+            # --------------------------------------------------
+            # Deduplication
+            # --------------------------------------------------
+
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_bytes = img_byte_arr.getvalue()
+            
+            img_hash = hashlib.md5(img_bytes).hexdigest()
+
+            if img_hash in seen_hashes:
+                canonical_id = seen_hashes[img_hash]
+                canonical_visual = canonical_visuals[canonical_id]
+                canonical_image_path = canonical_visual["image_path"]
+                
+                print(
+                    f"Duplicate image found (Page {page_number}). "
+                    f"Mapping to canonical: {canonical_image_path}"
+                )
+                
+                duplicate_count += 1
+                
+                # Append occurrence
+                if "occurrences" not in canonical_visual:
+                    canonical_visual["occurrences"] = []
+                
+                canonical_visual["occurrences"].append({
+                    "page_number": page_number,
+                    "bbox": bbox_data
+                })
+                
+                # Store mapped image by page
+                if page_number is not None:
+                    if page_number not in page_images:
+                        page_images[page_number] = []
+                    page_images[page_number].append(canonical_image_path)
+                
+                continue
+
+            # --------------------------------------------------
+            # Save image (New Canonical)
+            # --------------------------------------------------
+
+            image.save(
+                image_path
+            )
+
+            saved_count += 1
+
+            print(
+                f"Image saved: "
+                f"{image_path}"
+            )
 
             # --------------------------------------------------
             # Store image by page
@@ -259,12 +306,22 @@ def extract_text(pdf_path, output_dir):
                     item.label
                 ),
 
-                "self_ref": item.self_ref
+                "self_ref": item.self_ref,
+
+                "occurrences": [
+                    {
+                        "page_number": page_number,
+                        "bbox": bbox_data
+                    }
+                ]
             }
 
             visual_elements.append(
                 visual_element
             )
+            
+            seen_hashes[img_hash] = visual_id
+            canonical_visuals[visual_id] = visual_element
 
             print(
                 f"Visual metadata created: "
@@ -278,6 +335,183 @@ def extract_text(pdf_path, output_dir):
                 f"Could not save image "
                 f"{image_count}: {e}"
             )
+
+    # ==================================================
+    # LAYER 2: VISUAL GROUPING & RECONSTRUCTION
+    # ==================================================
+    
+    print("----------------------------------------")
+    print("LAYER 2: VISUAL GROUPING")
+    print("----------------------------------------")
+    
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+    except Exception as e:
+        print(f"Warning: Could not load pypdfium2 for reconstruction: {e}")
+        pdf = None
+        
+    if pdf:
+        # Group elements by page
+        page_to_elements = {}
+        for el in visual_elements:
+            pn = el.get("page_number")
+            if pn is not None:
+                page_to_elements.setdefault(pn, []).append(el)
+        
+        group_id_counter = 0
+        
+        for pn, elements in page_to_elements.items():
+            # Filter out heavily repeated elements (like logos)
+            page_candidates = []
+            for el in elements:
+                occ = el.get("occurrences", [])
+                if len(occ) <= 2 and el.get("bbox"):
+                    page_candidates.append(el)
+            
+            if len(page_candidates) < 2:
+                continue
+            
+            # Helper to parse bbox
+            def parse_bbox(el):
+                b = el["bbox"]
+                l, t, r, b_coord = b.get("l", 0), b.get("t", 0), b.get("r", 0), b.get("b", 0)
+                return {
+                    "min_x": min(l, r),
+                    "max_x": max(l, r),
+                    "min_y": min(t, b_coord),
+                    "max_y": max(t, b_coord),
+                    "origin": b.get("coord_origin", "BOTTOMLEFT").upper(),
+                    "el": el
+                }
+            
+            parsed = [parse_bbox(el) for el in page_candidates]
+            
+            # Distance function
+            def is_adjacent(a, b, threshold=60.0):
+                dx = max(0, max(a["min_x"], b["min_x"]) - min(a["max_x"], b["max_x"]))
+                dy = max(0, max(a["min_y"], b["min_y"]) - min(a["max_y"], b["max_y"]))
+                return max(dx, dy) < threshold
+                
+            # Union-find or simple connected components
+            groups = []
+            visited = set()
+            for i in range(len(parsed)):
+                if i in visited:
+                    continue
+                
+                # BFS to find cluster
+                cluster = [parsed[i]]
+                visited.add(i)
+                
+                queue = [parsed[i]]
+                while queue:
+                    curr = queue.pop(0)
+                    for j in range(len(parsed)):
+                        if j not in visited and is_adjacent(curr, parsed[j]):
+                            visited.add(j)
+                            cluster.append(parsed[j])
+                            queue.append(parsed[j])
+                
+                groups.append(cluster)
+                
+            # Reconstruct groups
+            for group in groups:
+                if len(group) < 2:
+                    continue
+                
+                group_id_counter += 1
+                
+                min_x = min(item["min_x"] for item in group)
+                max_x = max(item["max_x"] for item in group)
+                min_y = min(item["min_y"] for item in group)
+                max_y = max(item["max_y"] for item in group)
+                
+                pad = 10.0
+                min_x = max(0.0, min_x - pad)
+                min_y = max(0.0, min_y - pad)
+                max_x += pad
+                max_y += pad
+                
+                # Check if the group covers almost the whole page (avoid giant crops)
+                # We'll just render it, but we can check if it's too big later
+                
+                try:
+                    # PDF pages are 0-indexed in pypdfium2
+                    page_obj = pdf[pn - 1]
+                    page_w, page_h = page_obj.get_size()
+                    
+                    # Avoid grouping the entire page (e.g. if > 80% area)
+                    group_area = (max_x - min_x) * (max_y - min_y)
+                    page_area = page_w * page_h
+                    if group_area > page_area * 0.8:
+                        print(f"Group on page {pn} is too large, skipping reconstruction.")
+                        continue
+                    
+                    # Coordinate mapping
+                    origin = group[0]["origin"]
+                    if "TOPLEFT" in origin:
+                        crop_top = min_y
+                        crop_bottom = max_y
+                    else:
+                        crop_top = page_h - max_y
+                        crop_bottom = page_h - min_y
+                        
+                    scale = 3.0
+                    crop_box = (
+                        int(min_x * scale),
+                        int(crop_top * scale),
+                        int(max_x * scale),
+                        int(crop_bottom * scale)
+                    )
+                    
+                    bitmap = page_obj.render(scale=scale)
+                    pil_image = bitmap.to_pil()
+                    cropped = pil_image.crop(crop_box)
+                    
+                    group_image_path = image_dir / f"reconstructed_page{pn}_group{group_id_counter}.png"
+                    cropped.save(group_image_path)
+                    
+                    print(f"Reconstructed visual saved: {group_image_path} (from {len(group)} elements)")
+                    
+                    union_bbox = {
+                        "l": min_x,
+                        "t": max_y if "BOTTOMLEFT" in origin else min_y,
+                        "r": max_x,
+                        "b": min_y if "BOTTOMLEFT" in origin else max_y,
+                        "coord_origin": origin
+                    }
+                    
+                    visual_id = f"group_{pn}_{group_id_counter}"
+                    
+                    source_ids = [item["el"]["visual_id"] for item in group]
+                    
+                    group_element = {
+                        "visual_id": visual_id,
+                        "image_path": str(group_image_path),
+                        "page_number": pn,
+                        "bbox": union_bbox,
+                        "caption": "",
+                        "type": "reconstructed_group",
+                        "self_ref": "",
+                        "source_visual_ids": source_ids,
+                        "occurrences": [
+                            {
+                                "page_number": pn,
+                                "bbox": union_bbox
+                            }
+                        ]
+                    }
+                    
+                    visual_elements.append(group_element)
+                    
+                    # Add to page_images so it gets attached to chunks
+                    if pn not in page_images:
+                        page_images[pn] = []
+                    page_images[pn].append(str(group_image_path))
+                    
+                except Exception as e:
+                    print(f"Failed to reconstruct group on page {pn}: {e}")
 
     # --------------------------------------------------
     # 6. Save visual manifest
@@ -384,6 +618,11 @@ def extract_text(pdf_path, output_dir):
     print(
         f"Total images actually saved: "
         f"{saved_count}"
+    )
+
+    print(
+        f"Duplicate images skipped: "
+        f"{duplicate_count}"
     )
 
     print(

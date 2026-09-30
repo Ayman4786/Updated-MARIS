@@ -1,5 +1,6 @@
 import chromadb
 import hashlib
+import json
 
 
 class VectorStoreManager:
@@ -64,13 +65,51 @@ class VectorStoreManager:
             ids.append(chunk_id)
 
         # --------------------------------------------------
+        # Defensive metadata sanitization for ChromaDB:
+        # ChromaDB accepts only str, int, float, bool.
+        # Any list or dict is serialized to a JSON string.
+        # --------------------------------------------------
+
+        sanitized_metadatas = []
+
+        for meta in metadata_list:
+
+            clean_meta = {}
+
+            for key, val in meta.items():
+
+                if isinstance(val, (list, dict)):
+
+                    json_key = (
+                        key
+                        if key.endswith("_json")
+                        else f"{key}_json"
+                    )
+
+                    clean_meta[json_key] = json.dumps(val)
+
+                elif val is None:
+
+                    clean_meta[key] = ""
+
+                elif isinstance(val, (str, int, float, bool)):
+
+                    clean_meta[key] = val
+
+                else:
+
+                    clean_meta[key] = str(val)
+
+            sanitized_metadatas.append(clean_meta)
+
+        # --------------------------------------------------
         # Store in ChromaDB
         # --------------------------------------------------
 
         self.collection.upsert(
             ids=ids,
             embeddings=embeddings,
-            metadatas=metadata_list,
+            metadatas=sanitized_metadatas,
             documents=chunks
         )
 

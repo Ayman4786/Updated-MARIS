@@ -40,9 +40,9 @@ class VisualRAG:
             f"{self.device}"
         )
 
-    # --------------------------------------------------
-    # Normalize embedding
-    # --------------------------------------------------
+    # ==================================================
+    # NORMALIZE EMBEDDING
+    # ==================================================
 
     def _normalize(self, embedding):
 
@@ -52,9 +52,9 @@ class VisualRAG:
             dim=-1
         )
 
-    # --------------------------------------------------
-    # Create text/query embedding
-    # --------------------------------------------------
+    # ==================================================
+    # TEXT EMBEDDING
+    # ==================================================
 
     def _get_text_embedding(
         self,
@@ -68,9 +68,9 @@ class VisualRAG:
             truncation=True
         )
 
-        input_ids = inputs["input_ids"].to(
-            self.device
-        )
+        input_ids = inputs[
+            "input_ids"
+        ].to(self.device)
 
         attention_mask = inputs[
             "attention_mask"
@@ -78,26 +78,14 @@ class VisualRAG:
 
         with torch.no_grad():
 
-            # ------------------------------------------
-            # Run CLIP text encoder directly
-            # ------------------------------------------
-
             text_outputs = self.model.text_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask
             )
 
-            # ------------------------------------------
-            # Get pooled text representation
-            # ------------------------------------------
-
             pooled_output = (
                 text_outputs.pooler_output
             )
-
-            # ------------------------------------------
-            # Project into CLIP embedding space
-            # ------------------------------------------
 
             embedding = self.model.text_projection(
                 pooled_output
@@ -107,9 +95,9 @@ class VisualRAG:
             embedding
         )
 
-    # --------------------------------------------------
-    # Create image embedding
-    # --------------------------------------------------
+    # ==================================================
+    # IMAGE EMBEDDING
+    # ==================================================
 
     def _get_image_embedding(
         self,
@@ -132,27 +120,15 @@ class VisualRAG:
 
         with torch.no_grad():
 
-            # ------------------------------------------
-            # Run CLIP vision encoder directly
-            # ------------------------------------------
-
             vision_outputs = (
                 self.model.vision_model(
                     pixel_values=pixel_values
                 )
             )
 
-            # ------------------------------------------
-            # Get pooled image representation
-            # ------------------------------------------
-
             pooled_output = (
                 vision_outputs.pooler_output
             )
-
-            # ------------------------------------------
-            # Project into CLIP embedding space
-            # ------------------------------------------
 
             embedding = self.model.visual_projection(
                 pooled_output
@@ -162,9 +138,9 @@ class VisualRAG:
             embedding
         )
 
-    # --------------------------------------------------
-    # Load visual manifest
-    # --------------------------------------------------
+    # ==================================================
+    # LOAD VISUAL MANIFEST
+    # ==================================================
 
     def _load_manifest(
         self,
@@ -204,9 +180,9 @@ class VisualRAG:
 
             return []
 
-    # --------------------------------------------------
-    # Cache path
-    # --------------------------------------------------
+    # ==================================================
+    # EMBEDDING CACHE PATH
+    # ==================================================
 
     def _get_cache_path(
         self,
@@ -218,9 +194,9 @@ class VisualRAG:
             / "visual_embeddings.json"
         )
 
-    # --------------------------------------------------
-    # Load cached image embeddings
-    # --------------------------------------------------
+    # ==================================================
+    # LOAD EMBEDDING CACHE
+    # ==================================================
 
     def _load_embedding_cache(
         self,
@@ -254,9 +230,9 @@ class VisualRAG:
 
             return {}
 
-    # --------------------------------------------------
-    # Save cached image embeddings
-    # --------------------------------------------------
+    # ==================================================
+    # SAVE EMBEDDING CACHE
+    # ==================================================
 
     def _save_embedding_cache(
         self,
@@ -268,25 +244,33 @@ class VisualRAG:
             document_dir
         )
 
-        with open(
-            cache_path,
-            "w",
-            encoding="utf-8"
-        ) as file:
+        try:
 
-            json.dump(
-                cache,
-                file
+            with open(
+                cache_path,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                json.dump(
+                    cache,
+                    file
+                )
+
+        except Exception as error:
+
+            print(
+                f"Failed to save embedding cache: "
+                f"{error}"
             )
 
-    # --------------------------------------------------
-    # Get or create image embedding
-    # --------------------------------------------------
+    # ==================================================
+    # GET OR CREATE IMAGE EMBEDDING
+    # ==================================================
 
     def _get_cached_image_embedding(
         self,
         visual: dict,
-        document_dir: Path,
         cache: dict
     ):
 
@@ -302,9 +286,9 @@ class VisualRAG:
 
             return None
 
-        # ----------------------------------------------
-        # Already cached
-        # ----------------------------------------------
+        # --------------------------------------------------
+        # USE CACHE IF AVAILABLE
+        # --------------------------------------------------
 
         if visual_id in cache:
 
@@ -325,9 +309,9 @@ class VisualRAG:
                     f"for visual: {visual_id}"
                 )
 
-        # ----------------------------------------------
-        # Image must exist
-        # ----------------------------------------------
+        # --------------------------------------------------
+        # CHECK IMAGE
+        # --------------------------------------------------
 
         if not Path(image_path).exists():
 
@@ -338,9 +322,9 @@ class VisualRAG:
 
             return None
 
-        # ----------------------------------------------
-        # Generate embedding
-        # ----------------------------------------------
+        # --------------------------------------------------
+        # CREATE EMBEDDING
+        # --------------------------------------------------
 
         try:
 
@@ -357,9 +341,9 @@ class VisualRAG:
 
             return None
 
-        # ----------------------------------------------
-        # Save embedding to cache
-        # ----------------------------------------------
+        # --------------------------------------------------
+        # CACHE EMBEDDING
+        # --------------------------------------------------
 
         cache[visual_id] = (
             embedding
@@ -370,9 +354,9 @@ class VisualRAG:
 
         return embedding
 
-    # --------------------------------------------------
-    # Retrieve most relevant visual
-    # --------------------------------------------------
+    # ==================================================
+    # RETRIEVE RELEVANT VISUALS
+    # ==================================================
 
     def retrieve(
         self,
@@ -386,9 +370,9 @@ class VisualRAG:
             / document_id
         )
 
-        # ----------------------------------------------
-        # Check document
-        # ----------------------------------------------
+        # ==================================================
+        # CHECK DOCUMENT
+        # ==================================================
 
         if not document_dir.exists():
 
@@ -399,9 +383,9 @@ class VisualRAG:
 
             return []
 
-        # ----------------------------------------------
-        # Load visuals
-        # ----------------------------------------------
+        # ==================================================
+        # LOAD ALL VISUALS
+        # ==================================================
 
         visuals = self._load_manifest(
             document_dir
@@ -421,9 +405,9 @@ class VisualRAG:
             f"{len(visuals)} visual(s)"
         )
 
-        # ----------------------------------------------
-        # Query embedding
-        # ----------------------------------------------
+        # ==================================================
+        # CREATE QUERY EMBEDDING
+        # ==================================================
 
         try:
 
@@ -443,9 +427,9 @@ class VisualRAG:
 
             return []
 
-        # ----------------------------------------------
-        # Load image embedding cache
-        # ----------------------------------------------
+        # ==================================================
+        # LOAD CACHE
+        # ==================================================
 
         cache = self._load_embedding_cache(
             document_dir
@@ -453,16 +437,15 @@ class VisualRAG:
 
         results = []
 
-        # ----------------------------------------------
-        # Compare query with every visual
-        # ----------------------------------------------
+        # ==================================================
+        # COMPARE QUERY WITH EVERY VISUAL
+        # ==================================================
 
         for visual in visuals:
 
             image_embedding = (
                 self._get_cached_image_embedding(
                     visual,
-                    document_dir,
                     cache
                 )
             )
@@ -471,9 +454,9 @@ class VisualRAG:
 
                 continue
 
-            # ------------------------------------------
-            # Image similarity
-            # ------------------------------------------
+            # --------------------------------------------------
+            # IMAGE SIMILARITY
+            # --------------------------------------------------
 
             image_score = (
                 torch.matmul(
@@ -483,9 +466,9 @@ class VisualRAG:
                 .item()
             )
 
-            # ------------------------------------------
-            # Caption similarity
-            # ------------------------------------------
+            # --------------------------------------------------
+            # CAPTION SIMILARITY
+            # --------------------------------------------------
 
             caption = (
                 visual
@@ -520,11 +503,9 @@ class VisualRAG:
                         f"{error}"
                     )
 
-                    caption_score = 0.0
-
-            # ------------------------------------------
-            # Hybrid visual + caption score
-            # ------------------------------------------
+            # --------------------------------------------------
+            # HYBRID VISUAL SCORE
+            # --------------------------------------------------
 
             if caption:
 
@@ -538,74 +519,86 @@ class VisualRAG:
 
                 final_score = image_score
 
-            result = {
+            results.append({
 
-                "visual_id": visual.get(
-                    "visual_id"
-                ),
+                "visual_id":
+                    visual.get(
+                        "visual_id"
+                    ),
 
-                "image_path": visual.get(
-                    "image_path"
-                ),
+                "image_path":
+                    visual.get(
+                        "image_path"
+                    ),
 
-                "page_number": visual.get(
-                    "page_number"
-                ),
+                "page_number":
+                    visual.get(
+                        "page_number"
+                    ),
 
-                "bbox": visual.get(
-                    "bbox"
-                ),
+                "bbox":
+                    visual.get(
+                        "bbox"
+                    ),
 
-                "caption": caption,
+                "caption":
+                    caption,
 
-                "type": visual.get(
-                    "type"
-                ),
+                "type":
+                    visual.get(
+                        "type"
+                    ),
 
-                "image_score": float(
-                    image_score
-                ),
+                "image_score":
+                    float(
+                        image_score
+                    ),
 
-                "caption_score": float(
-                    caption_score
-                ),
+                "caption_score":
+                    float(
+                        caption_score
+                    ),
 
-                "score": float(
-                    final_score
-                )
-            }
+                "score":
+                    float(
+                        final_score
+                    )
+            })
 
-            results.append(
-                result
-            )
-
-        # ----------------------------------------------
-        # Save newly created embeddings
-        # ----------------------------------------------
+        # ==================================================
+        # SAVE NEW EMBEDDINGS
+        # ==================================================
 
         self._save_embedding_cache(
             document_dir,
             cache
         )
 
-        # ----------------------------------------------
-        # Rank visuals
-        # ----------------------------------------------
+        # ==================================================
+        # RANK VISUALS
+        # ==================================================
 
         results.sort(
-            key=lambda item: item["score"],
+            key=lambda item:
+                item["score"],
             reverse=True
         )
 
+        # --------------------------------------------------
+        # IMPORTANT:
+        #
+        # Only the highest-ranked visuals are returned.
+        # The caller decides how many visuals to send
+        # to the VLM using top_k.
+        # --------------------------------------------------
+
         selected = results[:top_k]
 
-        # ----------------------------------------------
-        # Debug output
-        # ----------------------------------------------
+        # ==================================================
+        # DEBUG
+        # ==================================================
 
-        print(
-            "\nVISION RAG RESULTS:\n"
-        )
+        print("\nVISION RAG RESULTS:\n")
 
         for visual in selected:
 
@@ -654,3 +647,129 @@ class VisualRAG:
             )
 
         return selected
+
+    # ==================================================
+    # SCORE CANDIDATES ONLY
+    # ==================================================
+
+    def score_candidates(
+        self,
+        query: str,
+        candidate_paths: list[str],
+        document_id: str
+    ) -> list[dict]:
+        """
+        Score ONLY the provided candidate image paths against the query.
+        Uses cached embeddings from visual_embeddings.json whenever available.
+        Returns a list of candidate dictionaries sorted by score descending.
+        """
+        if not candidate_paths or not document_id:
+            return []
+
+        document_dir = Path("storage/documents") / document_id
+        if not document_dir.exists():
+            print(f"Document directory does not exist: {document_dir}")
+            return []
+
+        manifest_path = document_dir / "visual_manifest.json"
+        if not manifest_path.exists():
+            print(f"Visual manifest not found: {manifest_path}")
+            return []
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                visuals = json.load(f)
+        except Exception as error:
+            print(f"Failed to read visual manifest: {error}")
+            return []
+
+        # Normalize candidate paths for matching
+        normalized_candidates = {
+            Path(p).as_posix().lower(): p for p in candidate_paths
+        }
+        candidate_names = {
+            Path(p).name.lower(): p for p in candidate_paths
+        }
+
+        # Filter visuals to only candidates
+        candidate_visuals = []
+        for visual in visuals:
+            ip = visual.get("image_path", "")
+            if Path(ip).as_posix().lower() in normalized_candidates:
+                candidate_visuals.append(visual)
+            elif Path(ip).name.lower() in candidate_names:
+                candidate_visuals.append(visual)
+
+        if not candidate_visuals:
+            print("No matching candidate visuals found in manifest.")
+            return []
+
+        print(
+            f"Vision RAG scoring {len(candidate_visuals)} candidate visual(s)"
+        )
+
+        try:
+            query_embedding = self._get_text_embedding(query)
+        except Exception as error:
+            print(f"Failed to create query embedding: {error}")
+            return []
+
+        cache = self._load_embedding_cache(document_dir)
+        results = []
+
+        for visual in candidate_visuals:
+            image_embedding = self._get_cached_image_embedding(
+                visual,
+                cache
+            )
+
+            if image_embedding is None:
+                continue
+
+            # Image similarity
+            image_score = torch.matmul(
+                query_embedding,
+                image_embedding.T
+            ).item()
+
+            # Caption similarity
+            caption = visual.get("caption", "").strip()
+            caption_score = 0.0
+
+            if caption:
+                try:
+                    caption_embedding = self._get_text_embedding(caption)
+                    caption_score = torch.matmul(
+                        query_embedding,
+                        caption_embedding.T
+                    ).item()
+                except Exception as error:
+                    print(f"Caption embedding failed: {error}")
+
+            if caption:
+                final_score = 0.70 * image_score + 0.30 * caption_score
+            else:
+                final_score = image_score
+
+            results.append({
+                "visual_id": visual.get("visual_id"),
+                "image_path": visual.get("image_path"),
+                "page_number": visual.get("page_number"),
+                "bbox": visual.get("bbox"),
+                "caption": caption,
+                "type": visual.get("type"),
+                "image_score": float(image_score),
+                "caption_score": float(caption_score),
+                "score": float(final_score)
+            })
+
+        # Save any newly computed embeddings
+        self._save_embedding_cache(document_dir, cache)
+
+        # Sort candidate results descending by score
+        results.sort(
+            key=lambda item: item["score"],
+            reverse=True
+        )
+
+        return results

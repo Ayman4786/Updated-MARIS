@@ -4,6 +4,7 @@ from fastapi import File
 
 from pathlib import Path
 import uuid
+import json
 
 from ai.extraction.docling_extractor import extract_text
 
@@ -233,12 +234,74 @@ async def upload_pdf(
         # ------------------------------------------
 
         page_image_index = 0
+        total_page_images = len(page_image_paths)
+        num_chunks_on_page = len(page_chunks)
 
         # ------------------------------------------
         # Create metadata
         # ------------------------------------------
 
-        for page_chunk in page_chunks:
+        for chunk_idx, page_chunk in enumerate(page_chunks):
+
+            # --------------------------------------
+            # Count image markers in this chunk
+            # --------------------------------------
+
+            image_marker_count = (
+                page_chunk.count(
+                    "<!-- image -->"
+                )
+            )
+
+            chunk_image_paths = []
+
+            # --------------------------------------
+            # Assign the next k images to this chunk
+            # --------------------------------------
+
+            if (
+                image_marker_count > 0
+                and page_image_index < total_page_images
+            ):
+
+                end_index = min(
+                    page_image_index + image_marker_count,
+                    total_page_images
+                )
+
+                chunk_image_paths = [
+                    p
+                    for p in page_image_paths[page_image_index:end_index]
+                    if Path(p).exists()
+                ]
+
+                page_image_index = end_index
+
+            # --------------------------------------
+            # If this is the last chunk on this page
+            # and any page images remain unassigned,
+            # attach them so no images are lost
+            # --------------------------------------
+
+            if (
+                chunk_idx == num_chunks_on_page - 1
+                and page_image_index < total_page_images
+            ):
+
+                remaining_images = [
+                    p
+                    for p in page_image_paths[page_image_index:total_page_images]
+                    if Path(p).exists() and p not in chunk_image_paths
+                ]
+
+                chunk_image_paths.extend(remaining_images)
+                page_image_index = total_page_images
+
+            primary_image = (
+                chunk_image_paths[0]
+                if chunk_image_paths
+                else ""
+            )
 
             metadata = {
 
@@ -257,46 +320,29 @@ async def upload_pdf(
                 # IMPORTANT
                 # Actual PDF page
                 "page_number":
-                    page_number
+                    page_number,
+
+                # Multi-image list for chunks.json
+                "image_paths":
+                    chunk_image_paths,
+
+                # Backward compatibility
+                "image_path":
+                    primary_image,
+
+                "image_count":
+                    len(chunk_image_paths),
+
+                # JSON string for ChromaDB primitive compatibility
+                "image_paths_json":
+                    json.dumps(chunk_image_paths)
             }
 
-            # --------------------------------------
-            # Attach image to chunk
-            # --------------------------------------
-
-            image_marker_count = (
-                page_chunk.count(
-                    "<!-- image -->"
+            if chunk_image_paths:
+                print(
+                    f"Images attached to Chunk {global_chunk_id} (Page {page_number}): "
+                    f"{len(chunk_image_paths)} image(s) -> {[Path(p).name for p in chunk_image_paths]}"
                 )
-            )
-
-            if (
-                image_marker_count > 0
-                and page_image_index
-                < len(page_image_paths)
-            ):
-
-                image_path = (
-                    page_image_paths[
-                        page_image_index
-                    ]
-                )
-
-                if Path(
-                    image_path
-                ).exists():
-
-                    metadata[
-                        "image_path"
-                    ] = image_path
-
-                    print(
-                        f"Image attached:"
-                        f" Page {page_number}"
-                        f" -> {image_path}"
-                    )
-
-                page_image_index += 1
 
             # --------------------------------------
             # Create final chunk
@@ -407,17 +453,14 @@ async def upload_pdf(
     # 11. EXTRACT CHROMA METADATA
     # ==================================================
 
-    metadata_list = [
-
-        item["metadata"]
-
-        for item in all_chunks
-
-    ]
-
-    # ==================================================
-    # 12. STORE IN CHROMADB
-    # ==================================================
+    # Ensure ChromaDB metadata only contains primitive types (no lists)
+    chroma_metadata_list = []
+    for item in all_chunks:
+        meta = dict(item["metadata"])
+        meta.pop("image_paths", None)
+        if meta.get("image_path") is None:
+            meta["image_path"] = ""
+        chroma_metadata_list.append(meta)
 
     vector_store = (
         VectorStoreManager()
@@ -427,7 +470,7 @@ async def upload_pdf(
 
         chunks=chunks,
 
-        metadata_list=metadata_list,
+        metadata_list=chroma_metadata_list,
 
         embeddings=embeddings
 

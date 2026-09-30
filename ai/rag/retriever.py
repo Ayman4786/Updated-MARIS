@@ -1,3 +1,5 @@
+# ai/rag/retriever.py
+
 from rank_bm25 import BM25Okapi
 
 from ai.rag.embeddings_service import EmbeddingsService
@@ -39,8 +41,6 @@ class HybridRetriever:
         # OPTIONAL DOCUMENT FILTER
         # ==================================================
 
-        searchable_chunks = all_chunks
-
         if document_id:
 
             searchable_chunks = [
@@ -58,6 +58,10 @@ class HybridRetriever:
 
             ]
 
+        else:
+
+            searchable_chunks = all_chunks
+
         print(
             f"Chunks available for retrieval: "
             f"{len(searchable_chunks)}"
@@ -65,7 +69,35 @@ class HybridRetriever:
 
         if not searchable_chunks:
 
+            print(
+                "❌ No chunks available for "
+                "the selected document."
+            )
+
             return []
+
+        # ==================================================
+        # RETRIEVAL CANDIDATE COUNT
+        #
+        # We retrieve more candidates first.
+        #
+        # Final top_k is selected only AFTER
+        # combining semantic + lexical scores.
+        #
+        # This allows the RAG system to examine
+        # the available chunks before deciding
+        # what is actually relevant.
+        # ==================================================
+
+        candidate_k = min(
+            max(top_k * 3, 10),
+            len(searchable_chunks)
+        )
+
+        print(
+            f"Retrieval candidate count: "
+            f"{candidate_k}"
+        )
 
         # ==================================================
         # 1. VECTOR SEMANTIC SEARCH
@@ -80,7 +112,7 @@ class HybridRetriever:
         vector_results = (
             self.vector_store.search_vectors(
                 query_embedding=query_vector,
-                top_k=top_k,
+                top_k=candidate_k,
                 document_id=document_id
             )
         )
@@ -123,7 +155,7 @@ class HybridRetriever:
 
             reverse=True
 
-        )[:top_k]
+        )[:candidate_k]
 
         # ==================================================
         # 3. COLLECT VECTOR RESULTS
@@ -159,7 +191,9 @@ class HybridRetriever:
                 )
             ):
 
-                metadata = meta or {}
+                metadata = (
+                    meta or {}
+                )
 
                 result_document_id = (
                     metadata.get(
@@ -168,7 +202,7 @@ class HybridRetriever:
                 )
 
                 # --------------------------------------------------
-                # Safety filter
+                # Never allow another document into the result
                 # --------------------------------------------------
 
                 if (
@@ -185,21 +219,28 @@ class HybridRetriever:
                 )
 
                 distance = (
+
                     distances[index]
+
                     if index < len(distances)
+
                     else 0
+
                 )
 
                 candidates[key] = {
 
-                    "text": doc,
+                    "text":
+                        doc,
 
-                    "metadata": metadata,
+                    "metadata":
+                        metadata,
 
                     "vector_score":
                         1 / (1 + distance),
 
-                    "bm25_score": 0.0
+                    "bm25_score":
+                        0.0
 
                 }
 
@@ -238,11 +279,14 @@ class HybridRetriever:
 
                 candidates[key] = {
 
-                    "text": text,
+                    "text":
+                        text,
 
-                    "metadata": metadata,
+                    "metadata":
+                        metadata,
 
-                    "vector_score": 0.0,
+                    "vector_score":
+                        0.0,
 
                     "bm25_score":
                         float(
@@ -266,8 +310,14 @@ class HybridRetriever:
         if candidates:
 
             max_bm25 = max(
-                candidate["bm25_score"]
-                for candidate in candidates.values()
+
+                candidate[
+                    "bm25_score"
+                ]
+
+                for candidate
+                in candidates.values()
+
             )
 
             if max_bm25 > 0:
@@ -277,8 +327,13 @@ class HybridRetriever:
                     candidate[
                         "bm25_normalized"
                     ] = (
-                        candidate["bm25_score"]
+
+                        candidate[
+                            "bm25_score"
+                        ]
+
                         / max_bm25
+
                     )
 
             else:
@@ -309,15 +364,20 @@ class HybridRetriever:
                 )
             )
 
-            # Semantic search gets slightly higher weight.
-            candidate["final_score"] = (
+            candidate[
+                "final_score"
+            ] = (
+
                 0.60 * vector_score
+
                 +
+
                 0.40 * bm25_score
+
             )
 
         # ==================================================
-        # 7. SORT FINAL RESULTS
+        # 7. SORT ALL CANDIDATES
         # ==================================================
 
         ranked_candidates = sorted(
@@ -331,151 +391,110 @@ class HybridRetriever:
 
         )
 
+        print("\n")
+        print("=" * 60)
+        print("RANKED RETRIEVAL CANDIDATES")
+        print("=" * 60)
+
+        for index, candidate in enumerate(
+            ranked_candidates
+        ):
+
+            metadata = (
+                candidate.get(
+                    "metadata",
+                    {}
+                )
+            )
+
+            print(
+                f"{index + 1}. "
+                f"Page={metadata.get('page_number')} | "
+                f"Score={candidate['final_score']:.4f}"
+            )
+
         # ==================================================
-        # 8. ATTACH IMAGES FROM NEARBY CHUNKS
+        # 8. FINAL TOP-K TEXT CHUNKS
+        #
+        # IMPORTANT:
+        #
+        # Only these chunks are passed forward
+        # to ContextBuilder / LLM.
+        # ==================================================
+
+        final_candidates = (
+            ranked_candidates[:top_k]
+        )
+
+        # ==================================================
+        # 9. ATTACH ONLY DIRECTLY ASSOCIATED IMAGES
+        #
+        # DO NOT search nearby chunks here.
+        #
+        # Searching nearby chunks was the reason a single
+        # retrieved text result could acquire multiple
+        # unrelated images.
+        #
+        # An image is now attached only when the retrieved
+        # chunk itself contains image_path.
         # ==================================================
 
         enhanced_hits = []
 
-        for hit in ranked_candidates:
+        for hit in final_candidates:
 
             metadata = (
                 hit["metadata"].copy()
             )
 
-            image_path = metadata.get(
-                "image_path"
+            image_path = (
+                metadata.get(
+                    "image_path"
+                )
             )
 
             # --------------------------------------------------
-            # Already has image
+            # Validate image path
             # --------------------------------------------------
 
             if image_path:
 
-                enhanced_hits.append({
+                from pathlib import Path
 
-                    "text":
-                        hit["text"],
-
-                    "metadata":
-                        metadata,
-
-                    "score":
-                        hit["final_score"]
-
-                })
-
-                continue
-
-            # --------------------------------------------------
-            # Find corresponding chunk
-            # --------------------------------------------------
-
-            matching_index = None
-
-            for index, chunk in enumerate(
-                searchable_chunks
-            ):
-
-                if (
-                    chunk.get("text")
-                    == hit["text"]
-                ):
-
-                    chunk_document_id = (
-                        chunk.get(
-                            "metadata",
-                            {}
-                        ).get(
-                            "document_id"
-                        )
-                    )
-
-                    hit_document_id = (
-                        metadata.get(
-                            "document_id"
-                        )
-                    )
-
-                    if (
-                        chunk_document_id
-                        == hit_document_id
-                    ):
-
-                        matching_index = index
-
-                        break
-
-            # --------------------------------------------------
-            # Search nearby chunks
-            # --------------------------------------------------
-
-            if matching_index is not None:
-
-                start = max(
-                    0,
-                    matching_index - 1
+                image_file = Path(
+                    str(image_path)
                 )
 
-                end = min(
-                    len(searchable_chunks),
-                    matching_index + 2
-                )
+                if image_file.exists():
 
-                for nearby_chunk in searchable_chunks[
-                    start:end
-                ]:
-
-                    nearby_metadata = (
-                        nearby_chunk.get(
-                            "metadata",
-                            {}
-                        )
+                    metadata[
+                        "image_path"
+                    ] = str(
+                        image_file
                     )
 
-                    nearby_document_id = (
-                        nearby_metadata.get(
-                            "document_id"
-                        )
+                    print(
+                        "Direct image associated "
+                        "with retrieved chunk: "
+                        f"{image_file}"
                     )
 
-                    current_document_id = (
-                        metadata.get(
-                            "document_id"
-                        )
+                else:
+
+                    print(
+                        "⚠️ Image path stored in "
+                        "chunk does not exist: "
+                        f"{image_path}"
                     )
 
-                    # --------------------------------------------------
-                    # NEVER take image from another PDF
-                    # --------------------------------------------------
-
-                    if (
-                        nearby_document_id
-                        != current_document_id
-                    ):
-
-                        continue
-
-                    nearby_image = (
-                        nearby_metadata.get(
-                            "image_path"
-                        )
+                    metadata.pop(
+                        "image_path",
+                        None
                     )
 
-                    if nearby_image:
-
-                        metadata[
-                            "image_path"
-                        ] = nearby_image
-
-                        print(
-                            "Image associated "
-                            "with retrieved chunk: "
-                            f"{nearby_image}"
-                        )
-
-                        break
+            # --------------------------------------------------
+            # Add final hit
+            # --------------------------------------------------
 
             enhanced_hits.append({
 
@@ -490,12 +509,62 @@ class HybridRetriever:
 
             })
 
-            # --------------------------------------------------
-            # Stop after top_k
-            # --------------------------------------------------
+        # ==================================================
+        # 10. FINAL RESULTS
+        # ==================================================
 
-            if len(enhanced_hits) >= top_k:
+        print("\n")
+        print("=" * 60)
+        print("FINAL RETRIEVED CHUNKS")
+        print("=" * 60)
 
-                break
+        for index, hit in enumerate(
+            enhanced_hits
+        ):
+
+            metadata = (
+                hit.get(
+                    "metadata",
+                    {}
+                )
+            )
+
+            print(
+                f"\nChunk {index + 1}"
+            )
+
+            print(
+                f"Document: "
+                f"{metadata.get('document_id')}"
+            )
+
+            print(
+                f"Page: "
+                f"{metadata.get('page_number')}"
+            )
+
+            print(
+                f"Score: "
+                f"{hit.get('score')}"
+            )
+
+            if metadata.get(
+                "image_path"
+            ):
+
+                print(
+                    f"Image: "
+                    f"{metadata['image_path']}"
+                )
+
+            else:
+
+                print(
+                    "Image: None"
+                )
+
+            print(
+                "-" * 50
+            )
 
         return enhanced_hits
