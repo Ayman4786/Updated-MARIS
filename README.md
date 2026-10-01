@@ -1,207 +1,314 @@
 # MARIS
 
-## Overview
+MARIS is a multimodal Retrieval-Augmented Generation (RAG) system for asking questions about technical PDF documents. RAG means that the system first retrieves relevant material from a document and then gives that material to a language model to produce an answer. Multimodal means that the system can use both extracted text and document images.
 
-MARIS is a multimodal Retrieval-Augmented Generation (RAG) system for technical PDF documents. Built with FastAPI, MARIS accepts uploaded PDFs, extracts text and visual elements while preserving page-level information, creates searchable chunks, and intelligently retrieves text and visual context. It automatically detects when a user's question requires visual information, retrieves and ranks visual candidates, verifies them, and sends the relevant text and selected images to a multimodal Qwen model (via Groq) to generate accurate answers with source traceability.
+The current application has a Streamlit user interface and a FastAPI backend. A user uploads a PDF, waits for it to be indexed, and asks questions about that document. Text questions use retrieved text only. Questions that explicitly ask about a diagram, figure, chart, table, architecture, workflow, or similar visual can also retrieve and send a selected document image to Qwen.
 
-## Current Architecture Flow
+## Features
 
-Information flows through the MARIS system as follows:
+- PDF extraction with Docling, including page-aware Markdown and picture metadata.
+- Recursive page-level text chunking with source page and document metadata.
+- Text embeddings from `BAAI/bge-small-en-v1.5`.
+- Persistent ChromaDB storage and hybrid retrieval using vector similarity plus BM25 lexical scoring.
+- Visual intent detection based on explicit phrases and visual object/action keywords.
+- Visual candidate collection from retrieved chunks and relevant pages.
+- Conservative visual-noise filtering, CLIP ranking, and Qwen verification.
+- Exact visual deduplication, spatial visual grouping, and PDF-region reconstruction.
+- Grounded answers with filename, page, and retrieval score source information.
+- Streamlit PDF reader, chat history, source-page selector, and embedded PDF viewing.
+
+## Architecture And Workflow
+
+The backend has two registered routes: `POST /upload` indexes a PDF, and `POST /chat` retrieves context and generates an answer. The root route `GET /` is a simple server health response. The `session.py` and `highlight.py` files exist in `backend/routes`, but they are not included by `backend/main.py` and therefore do not expose routes in the running application.
+
+### End-to-end flow
 
 ```mermaid
-graph TD;
-    A[PDF] --> B[Docling Extraction]
-    B --> C[Page-aware Markdown + Visual Extraction]
-    C --> D[Layer 1: Exact Visual Deduplication]
-    D --> E[Layer 2: Visual Grouping + PDF-based Reconstruction]
-    E --> F[Chunking]
-    F --> G[Embeddings / ChromaDB / Hybrid Retrieval]
-    G --> H[Visual Intent Detection]
-    H --> I[Visual Candidate Collection]
-    I --> J[Visual Noise Filtering]
-    J --> K[CLIP Visual Ranking]
-    K --> L[Layer 3: Qwen Visual Verification]
-    L --> M[Final Visual Selection]
-    M --> N[Qwen Multimodal Answer Generation]
+flowchart TD
+    U[User] --> S[Streamlit frontend]
+    S -->|POST /upload with PDF| F[FastAPI backend]
+    F --> X[Docling PDF extraction]
+    X --> I[Page Markdown and visual metadata]
+    I --> C[Page-aware chunking]
+    C --> E[Text embeddings]
+    E --> V[ChromaDB indexing]
+    S -->|POST /chat with question and document_id| F
+    F --> R[Hybrid text retrieval]
+    R --> G[Context and prompt building]
+    G --> L[Groq Qwen answer generation]
+    L --> S
+    S --> O[Answer, sources, and PDF reader]
 ```
 
-## The Three Visual Layers
+Upload processing saves each document under `storage/documents/<document_id>/`, writes Markdown and manifests, embeds the chunks, and upserts them into the persistent `storage/chroma_db` collection named `pdf_chunks`.
 
-MARIS processes and filters visuals through three distinct layers to ensure only the most relevant and high-quality images are sent to the LLM.
+### Visual-question flow
 
-### Layer 1 — Visual Deduplication
-- Detects exact duplicate image bytes using an MD5 hash.
-- Avoids saving duplicate physical image files.
-- Preserves where duplicates occurred using occurrence metadata instead of storing duplicates.
-- Keeps complete page and bounding-box traceability.
+```mermaid
+flowchart TD
+    Q[Question] --> T[Text retrieval first]
+    T --> D{Explicit visual intent?}
+    D -->|No| TO[Build text-only prompt]
+    D -->|Yes| A[Collect chunk and parent-page candidates]
+    A --> N[Filter small visual noise]
+    N --> C[Rank candidates with CLIP]
+    C --> V[Layer 3: Qwen visual verification]
+    V --> F[Select highest final visual score]
+    F --> M[Send retrieved text plus selected image to Qwen]
+    TO --> M0[Send retrieved text only to Qwen]
+    M --> R[Answer and source response]
+    M0 --> R
+```
 
-### Layer 2 — Visual Grouping & Reconstruction
-- Resolves issues where Docling might extract parts of a larger diagram as fragmented, separate visual elements.
-- MARIS intelligently groups spatially related elements on the same page using proximity rules (BFS).
-- It calculates a union bounding box for the grouped elements.
-- It directly renders the corresponding region from the original PDF using `pypdfium2`, producing a reconstructed visual region.
-- Preserves source metadata and traceability for the newly grouped image.
-- *Note:* Grouping is intentionally conservative to prevent accidentally grouping the entire page.
+### Visual processing layers
 
-### Layer 3 — Verified Visual Ranking
-- **CLIP** (`openai/clip-vit-base-patch32`) provides the initial visual ranking, computing the similarity between the user's question and both the image embeddings and caption embeddings.
-- A small number of top candidates are then verified using the existing multimodal Qwen infrastructure.
-- Verification checks whether the candidate is genuinely relevant to the question, rejecting unrelated or purely decorative visuals.
-- If verification fails or is inconclusive, the system safely falls back to the original CLIP ranking.
-- Only the final selected visual is securely sent to the final Qwen answer-generation step.
+The extraction layers run during upload. The question-time visual stages run only after text retrieval and only when the question passes `requires_explicit_vision`.
 
-## Text RAG
+1. **Visual intent detection.** The chat route checks direct phrases such as `explain the diagram`, architecture/workflow terms, and combinations of visual-object and action keywords.
+2. **Visual candidate collection.** Candidates come from image metadata attached to retrieved chunks. The route can also load images from `pages.json` for the most relevant parent page. If no candidates are available, it falls back to the document visual manifest.
+3. **Noise filtering.** Candidates large enough to be diagrams or figures are preferred over small icons or logos. If no large candidates exist, candidates are retained.
+4. **CLIP ranking.** `openai/clip-vit-base-patch32` scores the supplied candidates against the question. Captions, when available, contribute to the visual score.
+5. **Layer 1 - exact visual deduplication.** During Docling extraction, PNG bytes are hashed with MD5. Duplicate images reuse the canonical image path and keep page and bounding-box occurrence metadata.
+6. **Layer 2 - spatial grouping and reconstruction.** On each page, nearby visual elements are grouped with a breadth-first search. The union bounding box is rendered from the original PDF with `pypdfium2`, creating a `reconstructed_group` image. Groups covering more than 80 percent of a page are skipped.
+7. **Layer 3 - multimodal verification.** Each CLIP-ranked candidate is sent to the same Qwen service with a strict JSON relevance prompt. Relevant candidates receive a boost, irrelevant candidates receive a penalty, and verification failures fall back to the CLIP score. The highest final score is selected.
+8. **Multimodal answer generation.** The selected image is base64 encoded and sent with the retrieved text to Qwen through Groq.
 
-When a document is uploaded, MARIS performs the following text processing flow:
-1. **Extraction:** PDF is converted to page-aware markdown via Docling.
-2. **Chunking:** A `RecursiveChunker` breaks text down into tokens (using paragraphs, sentences, and spaces as separators) while maintaining chunk overlap.
-3. **Embeddings & Indexing:** `BAAI/bge-small-en-v1.5` creates text embeddings, which are stored alongside their primitive metadata in **ChromaDB**.
-4. **Retrieval:** When a query arrives, `HybridRetriever` combines Vector Semantic Search (ChromaDB) with Lexical Search (`BM25Okapi`) to rank chunks.
-5. **LLM Execution:** The `ContextBuilder` formats the retrieved chunks, adding source and page number context, before passing it to Qwen for answer generation.
+Text-only questions still perform text retrieval and context construction, but bypass candidate collection, CLIP ranking, verification, and image transmission. The final Qwen request contains retrieved text only. Visual questions use both retrieved text and one final selected image when a usable candidate exists.
 
-## Visual RAG: Text-only vs. Visual Questions
+## Streamlit Frontend
 
-MARIS intelligently determines if an image needs to be included in the context:
+- `frontend/app.py` owns the page, Streamlit session state, PDF validation, upload lifecycle, chat submission, answer display, source display, and PDF reader layout.
+- `frontend/api/client.py` provides `MarisClient`, which calls `POST /upload` and `POST /chat`, parses JSON, and reports backend/network errors.
+- `frontend/components/chat_panel.py` renders the sidebar question form, chat history, and clear-chat action.
+- `frontend/components/source_panel.py` renders filename, page, and relevance score information and lets the user select a source page.
+- `frontend/components/pdf_viewer.py` displays the uploaded PDF with Streamlit's native PDF component when available, or an embedded base64 PDF iframe when a source page is selected or the native component is unavailable.
+- `frontend/utils/config.py` reads the optional `MARIS_BACKEND_URL`, defaulting to `http://127.0.0.1:8000`.
 
-- **Text-only question:** Visual processing is bypassed entirely, and zero images are sent to Qwen. This saves token budget and improves response time.
-- **Visual question:** If visual intent is detected (e.g., "explain the diagram" or "architecture of the system"), MARIS:
-  - Retrieves relevant text/pages.
-  - Collects visual candidates directly attached to retrieved chunks or relevant pages.
-  - Filters small visual noise (like tiny logos).
-  - Ranks candidates using CLIP.
-  - Verifies the top candidates via Layer 3.
-  - Sends the selected image(s) alongside the retrieved text to Qwen.
+The user selects one PDF in the uploader. The frontend rejects files that do not have a `.pdf` suffix or `%PDF` header, sends valid files to the backend, stores the returned `document_id`, and enables the question form only after successful indexing. Answers and source records are displayed beside the PDF reader; selecting a source page changes the PDF view to that page.
 
-## How It Works (Example Scenario)
-
-**User asks:** *"What are the main layers shown in the technical architecture diagram?"*
-
-1. **Detection:** MARIS identifies "technical architecture diagram" as a visual intent.
-2. **Text Retrieval:** Relevant document/page content matching "technical architecture" is retrieved.
-3. **Candidate Collection:** Visual candidates on those retrieved pages are collected.
-4. **Ranking:** CLIP ranks the collected visuals against the question.
-5. **Verification (Layer 3):** Qwen verifies if the top-ranked visual actually contains architectural layers.
-6. **Selection:** The most relevant, verified visual is selected.
-7. **Prompting:** The retrieved text and the selected visual are combined and sent to Qwen.
-8. **Generation:** Qwen generates the final, accurate answer.
-
-## Project Structure
+## Repository Structure
 
 ```text
 MARIS/
 ├── ai/
-│   ├── extraction/
-│   │   └── docling_extractor.py      # PDF parsing, Markdown/Picture extraction, Layers 1 & 2
+│   ├── extraction/docling_extractor.py  # Page Markdown, pictures, Layers 1 and 2
 │   ├── llm/
-│   │   ├── llm_service.py            # Interfaces with Groq/Qwen for generation
-│   │   └── prompt_builder.py         # Constructs the system prompts
+│   │   ├── llm_service.py               # Groq client and Qwen generation
+│   │   ├── prompt_builder.py             # Text and image-aware prompts
+│   │   └── question_service.py          # LLM package module
 │   └── rag/
-│       ├── chunk_storage.py          # Saves/loads chunk data locally
-│       ├── chunker.py                # Recursive text chunking logic
-│       ├── context_builder.py        # Formats text context blocks
-│       ├── embeddings_service.py     # Generates text embeddings (BAAI/bge-small-en-v1.5)
-│       ├── retriever.py              # Hybrid retrieval (BM25 + ChromaDB Vector search)
-│       ├── vector_store.py           # ChromaDB client management
-│       └── visual_rag.py             # CLIP-based candidate ranking
+│       ├── chunker.py                    # Recursive text chunking
+│       ├── chunk_storage.py              # JSON chunk persistence
+│       ├── context_builder.py            # Retrieved context formatting
+│       ├── embeddings_service.py         # BGE text embeddings
+│       ├── retriever.py                  # ChromaDB plus BM25 retrieval
+│       ├── vector_store.py               # Persistent ChromaDB collection
+│       └── visual_rag.py                 # CLIP visual scoring and cache
 ├── backend/
-│   ├── main.py                       # FastAPI application entry point
-│   └── routes/
-│       ├── chat.py                   # Chat endpoint, intent detection, visual candidate handling
-│       └── upload.py                 # Document upload endpoint, triggers ingestion pipeline
-├── frontend/                         # Vite/React frontend (currently default starter)
-├── storage/                          # Local storage for extracted docs, images, and chromadb
-├── tests/
-│   ├── test_full_rag.py
-│   ├── test_image_retrieval_fix.py
-│   ├── test_layer1_deduplication.py
-│   ├── test_layer2_grouping.py
-│   └── test_layer3_verification.py
-├── .env.example
-├── README.md
-└── requirements.txt
+│   ├── main.py                           # FastAPI app and registered routes
+│   ├── config.py                         # Currently empty configuration module
+│   ├── routes/
+│   │   ├── chat.py                       # Query, visual intent, sources
+│   │   ├── upload.py                      # PDF ingestion and indexing
+│   │   ├── highlight.py                  # Present but not registered
+│   │   └── session.py                    # Present but not registered
+│   └── schemas/                          # Present schema modules; currently empty
+├── frontend/
+│   ├── app.py                            # Streamlit application entry point
+│   ├── api/client.py                      # FastAPI HTTP client
+│   ├── components/                       # Chat, PDF, and source UI
+│   └── utils/config.py                   # Backend URL configuration
+├── storage/
+│   ├── documents/                        # Uploaded PDFs and generated artifacts
+│   └── chroma_db/                        # Persistent ChromaDB data
+├── tests/                                # Unit and integration-style tests
+├── .env.example                          # Groq key template
+├── requirements.txt                      # Python dependencies
+└── README.md
 ```
 
-## Important Components
+Generated document artifacts include `document.md`, `pages.json`, `chunks.json`, `visual_manifest.json`, optional `visual_embeddings.json`, and an `images/` directory. These are created under each uploaded document directory and are intentionally omitted from the tree above.
 
-- `ai/extraction/docling_extractor.py`: Handles raw PDF processing via Docling. Implements **Layer 1** (MD5 visual deduplication) and **Layer 2** (BFS-based spatial visual grouping and `pypdfium2` image reconstruction).
-- `ai/rag/chunker.py`: Splits markdown into recursive sized chunks, preserving tokens and characters.
-- `ai/rag/embeddings_service.py`: Leverages HuggingFace's `BAAI/bge-small-en-v1.5` to embed text chunks.
-- `ai/rag/vector_store.py`: Manages the local `ChromaDB` collection, handling storage, metadata serialization, and vector search.
-- `ai/rag/retriever.py`: Implements a `HybridRetriever` joining ChromaDB's vector scores and `rank_bm25`'s lexical scores.
-- `ai/rag/visual_rag.py`: Uses `openai/clip-vit-base-patch32` to rank visuals against queries using both image and caption similarities.
-- `ai/rag/context_builder.py`: Formats retrieved RAG chunks nicely for the LLM to process.
-- `ai/llm/llm_service.py`: Constructs multimodal payloads (base64 images + text) to interface with the Groq Qwen (`qwen/qwen3.8-27b`) model.
-- `backend/routes/upload.py`: The `/upload` endpoint triggering document intake, extraction, chunking, embedding, and storage.
-- `backend/routes/chat.py`: The `/chat` endpoint responsible for visual intent detection, text retrieval, fetching visual candidates, and orchestrating Layer 3 logic.
+## Technology Stack
 
-## Setup / Running Instructions
+- Python, FastAPI, Uvicorn, and Streamlit
+- Docling and `pypdfium2` for PDF and visual extraction
+- PyTorch, Transformers, and Hugging Face models
+- `BAAI/bge-small-en-v1.5` for text embeddings
+- `openai/clip-vit-base-patch32` for visual ranking
+- ChromaDB for persistent vector storage
+- `rank-bm25` for lexical retrieval
+- Groq API with `qwen/qwen3.8-27b` for final text or multimodal answers
 
-**1. Create and activate a virtual environment**
-```bash
+## Setup And Configuration
+
+### Clone
+
+```powershell
+git clone https://github.com/Ayman4786/Updated-MARIS.git
+cd Updated-MARIS
+```
+
+### Create an environment
+
+Windows PowerShell:
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 ```
 
-**2. Install dependencies**
+Linux or macOS:
+
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-**3. Configure Environment Variables**
-Copy `.env.example` to `.env` and fill in your Groq API key:
+Install the dependencies from the repository's pinned dependency file:
+
 ```bash
+python -m pip install -r requirements.txt
+```
+
+### Configure API keys
+
+Copy `.env.example` to `.env` and replace the placeholder with a Groq API key. Do not commit the real key.
+
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+The backend reads:
+
+```text
 GROQ_API_KEY=your_groq_api_key_here
 ```
 
-**4. Start the backend**
+The frontend optionally reads `MARIS_BACKEND_URL`. If it is not set, it uses `http://127.0.0.1:8000`.
+
+## Running The Application
+
+Run the backend and frontend in separate terminals from the repository root, with the virtual environment activated in each terminal.
+
+Terminal 1 - FastAPI:
+
 ```bash
 uvicorn backend.main:app --reload
 ```
-The API will be available at `http://127.0.0.1:8000`.
 
-## API Overview
+The backend listens at `http://127.0.0.1:8000`. Its health response is available at `GET /`.
+
+Terminal 2 - Streamlit:
+
+```bash
+streamlit run frontend/app.py
+```
+
+Streamlit prints the local application URL, normally `http://localhost:8501`. Open that URL, upload a PDF, wait for processing to finish, and ask questions in the sidebar.
+
+The first indexing or visual-ranking request may download or initialize the configured Docling, embedding, or CLIP model files, so processing time and memory use depend on the document and local environment.
+
+## API Reference
+
+### `GET /`
+
+Returns:
+
+```json
+{"message": "Server Running"}
+```
 
 ### `POST /upload`
-- **Purpose:** Ingests a new PDF document into the system.
-- **Input:** Multipart form data containing the `file` (PDF).
-- **Output:** Returns JSON with ingestion status, a unique `document_id`, the total pages processed, chunks and embeddings created, and the total visual elements extracted.
+
+Accepts a multipart form upload with a required field named `file`. The field should contain a PDF. The route creates a generated document ID, extracts the document, writes its artifacts, creates embeddings, and stores chunks in ChromaDB.
+
+Successful responses include:
+
+```json
+{
+  "filename": "document.pdf",
+  "document_id": "document_<random-id>",
+  "status": "success",
+  "pages": 1,
+  "chunks_created": 1,
+  "embeddings_created": 1,
+  "images_created": 0,
+  "visual_elements": 0,
+  "document_folder": "storage/documents/...",
+  "chunks_file": "storage/documents/.../chunks.json",
+  "preview": "..."
+}
+```
+
+The numeric values and preview depend on the uploaded PDF.
 
 ### `POST /chat`
-- **Purpose:** Answers user questions based on ingested documents.
-- **Input:** JSON payload with `question` (string) and an optional `document_id` (string). If `document_id` is omitted, searches all documents.
-- **Output:** Returns JSON containing the `answer` (string) generated by the LLM, alongside debug/traceability data like `images_used` and relevant context.
 
-## Testing
+Accepts JSON with a required `question` string and an optional `document_id` string:
 
-Run the isolated test suite using the `unittest` framework:
+```json
+{
+  "question": "What is the main purpose of this system?",
+  "document_id": "document_<random-id>"
+}
+```
+
+When `document_id` is omitted, the route searches all uploaded document directories. The normal response contains:
+
+```json
+{
+  "question": "...",
+  "document_id": "...",
+  "answer": "...",
+  "sources": [
+    {
+      "document_id": "...",
+      "filename": "document.pdf",
+      "page": 1,
+      "score": 0.8
+    }
+  ],
+  "images_used": []
+}
+```
+
+For a visual question, `images_used` contains the selected image path when a candidate is selected. If no documents exist, or the requested document is missing, the route returns an explanatory answer with empty `sources` and `images_used` lists.
+
+## Testing And Current Status
+
+The focused visual-layer suite is run with:
 
 ```bash
 python -m unittest tests/test_layer1_deduplication.py tests/test_layer2_grouping.py tests/test_layer3_verification.py
 ```
-*Note: Layer 1, Layer 2, and Layer 3 tests currently pass successfully together.*
 
-### Known Environment Limitations in Tests
-Tests like `test_image_retrieval_fix.py` and `test_full_rag.py` have pre-existing environmental dependencies. For instance, `test_full_rag.py` expects specific pre-extracted markdown files (`storage/extracted_docs/CC_test.md`) to exist locally. Without these files, the tests will fail. Ensure your local environment has the required static files if you wish to run full RAG test scripts.
+In the current checkout, these Layer 1, Layer 2, and Layer 3 tests pass together. They cover MD5 deduplication and occurrence metadata, spatial grouping and PDF-region reconstruction, and Layer 3 selection and fallback behavior.
 
-## Known Limitations / Current Status
+The broader test set can be attempted with:
 
-**Currently Implemented:**
-- PDF extraction
-- Page-aware text retrieval
-- Visual intent detection
-- Exact visual deduplication (Layer 1)
-- Visual grouping/reconstruction (Layer 2)
-- CLIP ranking
-- Multimodal verification (Layer 3)
-- Multimodal Qwen answering
-- Source/page tracking
+```bash
+python -m unittest discover -s tests -p "test*.py"
+```
 
-**Known Limitations (Ongoing Improvements):**
-- **Process Flow Visual Retrieval:** During testing with realistic PDFs (e.g., SIH.pdf), it was observed that while architectural diagrams reconstruct and match perfectly, queries concerning process-flows can sometimes lead to unrelated visuals being selected (despite the text answer remaining correct). Visual candidate ranking for complex process diagrams remains an ongoing area of refinement.
-- **Large Diagram Safeguards:** The Layer 2 visual grouping intentionally aborts reconstruction if a group occupies >80% of a page area to avoid pulling in entire text pages. This may inadvertently skip some massive legitimate full-page diagrams.
+In the current checkout, discovery ran 10 tests and reported 4 errors. The errors include a missing legacy output directory for `test_chunk_storage.py`, missing `torch` and `fastapi` packages in the active interpreter, and the legacy full-RAG fixture path `storage/extracted_docs/CC_test.md`. Check the test output in the environment where they are run rather than treating this broader suite as proof of end-to-end accuracy.
 
-## Future Work
-- Improve visual grouping precision for complex process-flow diagrams.
-- Refine visual candidate selection and CLIP similarity thresholds.
-- Develop the Streamlit (or Vite/React) frontend for a seamless UI experience.
-- Broader evaluation and stress-testing on diverse technical PDFs.
+The tested SIH.pdf example successfully reconstructed architecture diagrams and answered architecture-related visual questions. A process-flow question has also previously selected an unrelated visual even when its text-based answer was correct. Visual retrieval is therefore implemented and tested in focused areas, but it is not perfect or universally accurate.
+
+## Current Limitations
+
+- Visual intent is keyword and phrase based; a visual question that does not match the implemented patterns can follow the text-only path.
+- Process-flow visual selection can still choose an unrelated image.
+- Layer 2 intentionally skips groups covering more than 80 percent of a page, which can omit some legitimate full-page diagrams.
+- The running application stores uploaded documents and ChromaDB data locally; there is no cleanup or multi-user lifecycle in the current code.
+- The frontend displays source metadata returned by the backend, but source scoring is retrieval metadata rather than a guarantee that every cited chunk fully supports the answer.
+
+## Future Improvements
+
+- Improve visual intent detection beyond fixed phrases and keywords.
+- Improve process-flow candidate ranking and evaluate it on more technical PDFs.
+- Refine grouping thresholds and safeguards for large diagrams.
+- Add broader, current end-to-end fixtures and isolate legacy tests from the active storage layout.
+- Register or remove unused route modules and fill the currently empty schema/configuration modules as the API evolves.
