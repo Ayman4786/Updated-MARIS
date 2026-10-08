@@ -36,6 +36,7 @@ MODEL_NAME = "qwen/qwen3.8-27b"
 
 # Maximum number of tokens generated for the final answer
 MAX_COMPLETION_TOKENS = 1000
+MAX_IMAGE_PAYLOAD_BYTES = 1_500_000
 
 
 # ==================================================
@@ -82,16 +83,66 @@ def remove_thinking(text: str) -> str:
 
 def encode_image(image_path: str) -> str:
 
-    with open(
-        image_path,
-        "rb"
-    ) as image_file:
-
+    with open(image_path, "rb") as image_file:
         image_bytes = image_file.read()
 
     return base64.b64encode(
         image_bytes
     ).decode("utf-8")
+
+
+def prepare_image_payload(image_path: str) -> tuple[str, str]:
+    """Return a bounded base64 payload and its matching MIME type."""
+    with open(image_path, "rb") as image_file:
+        image_bytes = image_file.read()
+    mime_type = get_image_mime_type(image_path)
+    if len(image_bytes) <= MAX_IMAGE_PAYLOAD_BYTES:
+        return base64.b64encode(image_bytes).decode("utf-8"), mime_type
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            image.thumbnail((1600, 1600))
+            output = BytesIO()
+            image.convert("RGB").save(
+                output, format="JPEG", quality=70, optimize=True
+            )
+            image_bytes = output.getvalue()
+        print(
+            f"[INFO] Compressed oversized image payload: "
+            f"{len(image_bytes):,} bytes"
+        )
+        return base64.b64encode(image_bytes).decode("utf-8"), "image/jpeg"
+    except (OSError, ValueError) as error:
+        print(f"[WARN] Could not compress image payload: {error}")
+        return base64.b64encode(image_bytes).decode("utf-8"), mime_type
+
+
+def is_request_size_error(error: Exception) -> bool:
+    if is_daily_token_quota_error(error):
+        return False
+    message = str(error).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "rate_limit",
+            "rate limit",
+            "tokens per minute",
+            "request too large",
+            "context length",
+            "token limit",
+        )
+    )
+
+
+def is_daily_token_quota_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "tokens per day" in message
+        or "tpd" in message
+        or "rate_limit_exceeded" in message
+    )
 
 
 # ==================================================
@@ -159,6 +210,7 @@ def generate_answer(
                 "text": prompt
             }
         ]
+        image_diagnostics = []
 
 
         # ==================================================
@@ -213,19 +265,29 @@ def generate_answer(
                 # Encode image
                 # --------------------------------------------------
 
-                base64_image = encode_image(
+                base64_image, mime_type = prepare_image_payload(
                     str(path)
+                )
+                dimensions = "unknown"
+                try:
+                    from PIL import Image
+
+                    with Image.open(path) as image:
+                        dimensions = f"{image.width}x{image.height}"
+                except (OSError, ValueError):
+                    pass
+                image_diagnostics.append(
+                    {
+                        "path": str(path),
+                        "dimensions": dimensions,
+                        "encoded_bytes": len(base64_image),
+                    }
                 )
 
 
                 # --------------------------------------------------
                 # Detect MIME type
                 # --------------------------------------------------
-
-                mime_type = get_image_mime_type(
-                    str(path)
-                )
-
 
                 # --------------------------------------------------
                 # Add image to multimodal request
@@ -278,6 +340,25 @@ def generate_answer(
             for item in content
             if item.get("type") == "image_url"
         )
+
+        text_characters = sum(
+            len(str(item.get("text", "")))
+            for item in content
+            if item.get("type") == "text"
+        )
+        print(
+            f"[GROQ REQUEST DIAGNOSTICS] model={MODEL_NAME} "
+            f"messages=1 text_chars={text_characters} "
+            f"images={image_count} max_completion_tokens={MAX_COMPLETION_TOKENS} "
+            f"reasoning_effort=none reasoning_format=hidden"
+        )
+        for index, diagnostic in enumerate(image_diagnostics):
+            print(
+                f"[GROQ IMAGE DIAGNOSTICS] index={index} "
+                f"path={diagnostic['path']} "
+                f"dimensions={diagnostic['dimensions']} "
+                f"encoded_bytes={diagnostic['encoded_bytes']}"
+            )
 
 
         # ==================================================
@@ -567,12 +648,15 @@ def generate_answer(
         # RATE LIMIT ERROR
         # ==================================================
 
-        if (
-            "rate_limit" in error_message
-            or "rate limit" in error_message
-            or "tokens per minute" in error_message
-            or "request too large" in error_message
-        ):
+        if is_daily_token_quota_error(e):
+            print("[ERROR] Groq daily token quota is exhausted.")
+            return (
+                "The configured Groq daily token quota is exhausted. "
+                "No answer was generated. Please wait for the quota to reset "
+                "or use a Groq project with available token quota."
+            )
+
+        if is_request_size_error(e):
 
             print("\n")
             print("=" * 60)

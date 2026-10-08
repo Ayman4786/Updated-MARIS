@@ -14,9 +14,24 @@ from ai.rag.visual_rag import VisualRAG
 
 from ai.llm.prompt_builder import build_prompt
 from ai.llm.llm_service import generate_answer
+from backend.persistence import DOCUMENTS_ROOT, MarisStore
 
 
 router = APIRouter()
+
+
+def bound_image_paths(image_paths: list[str], max_images: int = 1) -> list[str]:
+    """Keep the final multimodal request bounded and deterministic."""
+    result = []
+    seen = set()
+    for path in image_paths:
+        normalized = str(path)
+        if normalized and normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+        if len(result) >= max_images:
+            break
+    return result
 
 
 # ==================================================
@@ -38,6 +53,7 @@ class QuestionRequest(BaseModel):
     # --------------------------------------------------
 
     document_id: str | None = None
+    conversation_id: str | None = None
 
 
 # ==================================================
@@ -313,10 +329,16 @@ def identify_most_relevant_pages(
     - Direct presence of attached images in the chunk
     """
     page_scores = {}
+    stop_words = {
+        "what", "that", "this", "does", "show", "explain", "describe",
+        "tell", "about", "from", "with", "the", "for", "into", "which",
+        "where", "when", "are", "how", "can", "could", "would",
+    }
     q_words = [
-        w for w in re.findall(r'\w+', question.lower())
-        if len(w) > 3
+        word for word in re.findall(r"[a-z0-9]+", question.lower().replace("-", " "))
+        if len(word) > 2 and word not in stop_words
     ] if question else []
+    query_phrase = " ".join(q_words)
 
     for chunk in retrieved_chunks:
         metadata = chunk.get("metadata", {}) or {}
@@ -328,18 +350,21 @@ def identify_most_relevant_pages(
 
         pair = (str(doc_id), int(page_num))
         chunk_score = float(chunk.get("score", 0.0) or 0.0)
-        chunk_text = str(chunk.get("text", "")).lower()
+        chunk_text = re.sub(
+            r"\s+", " ", str(chunk.get("text", "")).lower().replace("-", " ")
+        ).strip()
 
-        # Keyword overlap bonus
-        overlap = sum(1 for w in q_words if w in chunk_text) if q_words else 0
+        matched_words = {word for word in q_words if word in chunk_text}
+        coverage = len(matched_words) / len(set(q_words)) if q_words else 0.0
+        phrase_match = bool(query_phrase and query_phrase in chunk_text)
 
-        # Direct visual presence bonus
+        # Exact concept/title matches must outweigh broad document similarity.
+        # Image presence is only a small tie-breaker, never the page authority.
         has_images = bool(metadata.get("image_paths") or metadata.get("image_path"))
-        visual_factor = 2.0 if has_images else 0.5
-
-        page_scores[pair] = (
-            page_scores.get(pair, 0.0)
-            + (chunk_score + (0.25 * overlap)) * visual_factor
+        lexical_score = (3.0 * coverage) + (2.0 if phrase_match else 0.0)
+        visual_tiebreaker = 0.1 if has_images else 0.0
+        page_scores[pair] = page_scores.get(pair, 0.0) + (
+            chunk_score + lexical_score + visual_tiebreaker
         )
 
     # Sort descending by score
@@ -752,6 +777,110 @@ def rank_visual_candidates(
     )
 
 
+def deduplicate_grounded_sources(
+    retrieved_chunks: list[dict],
+) -> list[dict]:
+    """Return one highest-scoring grounded source per document page."""
+    sources_by_page: dict[tuple[object, object], dict] = {}
+    for chunk in retrieved_chunks:
+        metadata = chunk.get("metadata", {}) or {}
+        document_id = metadata.get("document_id")
+        page = metadata.get("page_number")
+        source = {
+            "document_id": document_id,
+            "filename": metadata.get("filename"),
+            "page": page,
+            "score": chunk.get("score"),
+        }
+        key = (document_id, page)
+        existing = sources_by_page.get(key)
+        if existing is None:
+            sources_by_page[key] = source
+            continue
+        current_score = existing.get("score")
+        new_score = source.get("score")
+        if (
+            isinstance(new_score, (int, float))
+            and not isinstance(new_score, bool)
+            and (
+                not isinstance(current_score, (int, float))
+                or isinstance(current_score, bool)
+                or new_score > current_score
+            )
+        ):
+            sources_by_page[key] = source
+    return list(sources_by_page.values())
+
+
+# ==================================================
+# FULL-PAGE VISUAL FALLBACK
+# ==================================================
+
+def render_relevant_full_pages(
+    retrieved_chunks: list[dict],
+    documents_root: Path,
+    document_id: str | None = None,
+    question: str = "",
+    max_pages: int = 3,
+) -> list[dict]:
+    """Render only text-retrieved source pages for visual verification."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as error:
+        print(f"[WARN] Full-page fallback unavailable: {error}")
+        return []
+
+    rendered = []
+    seen = set()
+    ranked_pages = identify_most_relevant_pages(
+        retrieved_chunks,
+        question=question,
+    )
+    for page_document_id, page_number in ranked_pages:
+        if document_id and page_document_id != document_id:
+            continue
+        if len(rendered) >= max_pages or (page_document_id, page_number) in seen:
+            continue
+        seen.add((page_document_id, page_number))
+        document_dir = documents_root / page_document_id
+        pdfs = list(document_dir.glob("*.pdf"))
+        if not pdfs:
+            print(
+                f"[WARN] No source PDF for full-page fallback: "
+                f"{page_document_id} page {page_number}"
+            )
+            continue
+        output_dir = document_dir / "images"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"full_page_{page_number}.png"
+        try:
+            if not output_path.exists():
+                pdf = pdfium.PdfDocument(str(pdfs[0]))
+                page = pdf[page_number - 1]
+                bitmap = page.render(scale=2.0)
+                bitmap.to_pil().save(output_path)
+            if output_path.exists():
+                rendered.append(
+                    {
+                        "image_path": str(output_path),
+                        "document_id": page_document_id,
+                        "page_number": page_number,
+                        "type": "full_page_fallback",
+                        "score": 0.0,
+                    }
+                )
+                print(
+                    f"[FULL-PAGE] document={page_document_id} "
+                    f"page={page_number} path={output_path}"
+                )
+        except Exception as error:
+            print(
+                f"[WARN] Could not render full-page candidate "
+                f"{page_document_id} page {page_number}: {error}"
+            )
+    return rendered
+
+
 # ==================================================
 # CHAT ROUTE
 # ==================================================
@@ -779,9 +908,8 @@ async def chat(
     # DOCUMENT ROOT
     # ==================================================
 
-    documents_root = Path(
-        "storage/documents"
-    )
+    documents_root = DOCUMENTS_ROOT
+    store = MarisStore()
 
     # ==================================================
     # LOAD ALL DOCUMENTS
@@ -878,6 +1006,30 @@ async def chat(
                     []
 
             }
+
+    conversation = None
+    requested_conversation_id = getattr(request, "conversation_id", None)
+    if requested_conversation_id:
+        conversation = store.get_conversation(requested_conversation_id)
+        if not conversation or conversation["document_id"] != selected_document_id:
+            return {
+                "question": request.question,
+                "answer": "The requested conversation was not found for this document.",
+                "document_id": selected_document_id,
+                "conversation_id": requested_conversation_id,
+                "sources": [],
+                "images_used": [],
+            }
+    elif selected_document_id:
+        conversation = store.create_conversation(selected_document_id)
+    conversation_id = conversation["conversation_id"] if conversation else None
+    prior_messages = (
+        store.recent_messages(conversation_id)
+        if conversation_id
+        else []
+    )
+    if conversation_id:
+        store.add_message(conversation_id, "user", request.question)
 
     # ==================================================
     # INITIALIZE RAG
@@ -996,7 +1148,7 @@ async def chat(
 
     context = (
         ContextBuilder.build_context(
-            retrieved_chunks
+            retrieved_chunks,
         )
     )
 
@@ -1118,25 +1270,10 @@ async def chat(
                 )
 
             else:
-
                 print(
-                    "No candidate images found in retrieved text context. "
-                    "Falling back to complete document visual manifest."
+                    "No crop candidates found; full-page fallback will use "
+                    "retrieved page text rather than the complete visual manifest."
                 )
-
-                try:
-                    visual_rag = VisualRAG()
-                    visual_results = visual_rag.retrieve(
-                        query=request.question,
-                        document_id=effective_document_id,
-                        top_k=VISUAL_TOP_K
-                    )
-                    for visual in visual_results:
-                        ip = visual.get("image_path")
-                        if ip and Path(ip).exists():
-                            image_paths.append(str(Path(ip)))
-                except Exception as error:
-                    print(f"[ERROR] Visual RAG fallback failed: {error}")
 
     # ==================================================
     # VISION LOG
@@ -1161,7 +1298,7 @@ async def chat(
     # LAYER 3: VERIFIED VISUAL RANKING
     # ==================================================
 
-    if explicit_vision and image_paths:
+    if explicit_vision:
         print("\n")
         print("=" * 60)
         print("LAYER 3: VERIFIED VISUAL RANKING")
@@ -1172,9 +1309,11 @@ async def chat(
             prompt = f"""You are a strict visual verification system.
 The user's question is: "{q}"
 
-Evaluate if the attached image is semantically relevant to answering the question.
-Does it contain the specific diagram, chart, or architecture requested?
-If it's just a tiny decorative icon, a logo, or an unrelated screenshot, mark relevant as false.
+Evaluate whether the attached image itself contains the specific visual information
+requested by the user. A document logo, product logo, section heading, decorative
+icon, title page, or merely related page is NOT relevant unless it contains the
+requested diagram, chart, table, workflow, or process structure. Mark relevant
+false when the requested visual cannot be identified in the image.
 
 Respond STRICTLY with valid JSON only, no markdown, no backticks.
 {{
@@ -1189,78 +1328,104 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
                 if ans.startswith("```"): ans = ans[3:]
                 if ans.endswith("```"): ans = ans[:-3]
                 
-                return json.loads(ans.strip())
+                verdict = json.loads(ans.strip())
+                if not isinstance(verdict, dict):
+                    return None
+                verdict["verification_status"] = "success"
+                return verdict
             except Exception as e:
                 print(f"[ERROR] Verification failed for {ip}: {e}")
                 return None
 
-        final_scores = []
-        for visual in visual_results:
-            ip = visual.get("image_path")
-            if not ip or not Path(ip).exists():
-                continue
-                
-            clip_score = visual.get("score", 0.0)
-            v_type = visual.get("type", "")
-            
-            print(f"\nVISUAL VERIFICATION")
-            print(f"Question: {request.question}")
-            print(f"Candidate: {ip}")
-            print(f"Type: {v_type}")
-            print(f"CLIP score: {clip_score:.4f}")
-            
-            verdict = verify_visual_candidate(request.question, ip)
-            
-            if not verdict:
-                print("[WARN] Verification fallback.")
-                verdict = {"verification_status": "failed"}
-            else:
-                verdict["verification_status"] = "success"
-                
-            status = verdict.get("verification_status", "failed")
-            relevant = verdict.get("relevant", False)
-            conf = verdict.get("confidence", 0.0)
-            reason = verdict.get("reason", "")
-            
-            print(f"Verification status: {status}")
-            print(f"Verification: relevant={relevant}")
-            print(f"Verification confidence: {conf}")
-            print(f"Reason: {reason}")
-            
-            final_score = clip_score
-            
-            if status == "success":
+        def verify_and_rank_visuals(visuals: list[dict]) -> list[dict]:
+            verified = []
+            for visual in visuals:
+                ip = visual.get("image_path")
+                if not ip or not Path(ip).exists():
+                    continue
+                visual_document_id = visual.get("document_id", effective_document_id)
+                if (
+                    effective_document_id
+                    and visual_document_id
+                    and str(visual_document_id) != str(effective_document_id)
+                ):
+                    print(
+                        f"[WARN] Rejecting cross-document visual candidate: {ip}"
+                    )
+                    continue
+                document_root = documents_root / str(effective_document_id)
+                if document_root.exists():
+                    try:
+                        Path(ip).resolve().relative_to(document_root.resolve())
+                    except ValueError:
+                        print(
+                            f"[WARN] Rejecting visual outside document storage: {ip}"
+                        )
+                        continue
+                print(
+                    f"\nVISUAL VERIFICATION document="
+                    f"{visual.get('document_id', effective_document_id)} "
+                    f"page={visual.get('page_number', 'unknown')} "
+                    f"type={visual.get('type', '')} path={ip}"
+                )
+                verdict = verify_visual_candidate(request.question, str(ip))
+                relevant = bool(
+                    verdict
+                    and verdict.get("verification_status") == "success"
+                    and verdict.get("relevant") is True
+                )
+                print(
+                    f"Verification: relevant={relevant} "
+                    f"reason={verdict.get('reason', '') if verdict else 'invalid'}"
+                )
                 if relevant:
-                    final_score += 1.0 # Semantic relevance boost
-                    final_score += conf * 0.5 
-                    
-                    if v_type == "reconstructed_group":
-                        final_score += 0.1 # Modest structural preference / tie-breaker
-                else:
-                    final_score -= 1.0 # Penalty
-            # If failed, final_score == clip_score (no modifications)
-                
-            print(f"Final visual score: {final_score:.4f}")
-            
-            final_scores.append({
-                "image_path": ip,
-                "visual": visual,
-                "final_score": final_score,
-                "verdict": verdict
-            })
-            
-        if final_scores:
-            final_scores.sort(key=lambda x: x["final_score"], reverse=True)
-            best_candidate = final_scores[0]
-            
-            print("\nFINAL VISUAL SELECTION")
-            print(f"Selected: {best_candidate['image_path']}")
-            print(f"Type: {best_candidate['visual'].get('type', '')}")
-            print(f"Score: {best_candidate['final_score']:.4f}")
-            print(f"Verified: {best_candidate['verdict']}")
-            
-            image_paths = [best_candidate["image_path"]]
-            visual_results = [best_candidate["visual"]]
+                    verified.append(
+                        {
+                            "image_path": str(ip),
+                            "visual": visual,
+                            "final_score": float(visual.get("score", 0.0) or 0.0),
+                            "verdict": verdict,
+                        }
+                    )
+            return sorted(
+                verified,
+                key=lambda item: item["final_score"],
+                reverse=True,
+            )
+
+        verified_candidates = verify_and_rank_visuals(visual_results)
+        if not verified_candidates:
+            print("[INFO] All crop candidates rejected; rendering relevant pages.")
+            fallback_visuals = render_relevant_full_pages(
+                retrieved_chunks=retrieved_chunks,
+                documents_root=documents_root,
+                document_id=effective_document_id,
+                question=request.question,
+                max_pages=3,
+            )
+            verified_candidates = verify_and_rank_visuals(fallback_visuals)
+
+        if verified_candidates:
+            best_candidate = verified_candidates[0]
+            selected_visual = best_candidate["visual"]
+            print(
+                f"[VISUAL SELECTED] document="
+                f"{selected_visual.get('document_id', effective_document_id)} "
+                f"page={selected_visual.get('page_number', 'unknown')} "
+                f"type={selected_visual.get('type', '')} "
+                f"path={best_candidate['image_path']}"
+            )
+            image_paths = bound_image_paths(
+                [best_candidate["image_path"]]
+            )
+            visual_results = [selected_visual]
+        else:
+            print(
+                "[INFO] No visual candidate passed verification; "
+                "sending no image to final Qwen call."
+            )
+            image_paths = []
+            visual_results = []
             
     print(
         f"Images selected for Qwen: "
@@ -1335,8 +1500,17 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
             request.question,
 
         has_images=
-            bool(image_paths)
+            bool(image_paths),
 
+        conversation_history=
+            prior_messages
+
+    )
+
+    print(
+        f"[LLM REQUEST BUDGET] model=qwen/qwen3.8-27b "
+        f"context_chars={len(context)} chunks={len(retrieved_chunks)} "
+        f"images={len(image_paths)} prompt_chars={len(prompt)}"
     )
 
     # ==================================================
@@ -1374,54 +1548,31 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
     # BUILD SOURCE INFORMATION
     # ==================================================
 
-    sources = []
-
-    for chunk in retrieved_chunks:
-
-        metadata = (
-            chunk.get(
-                "metadata",
-                {}
-            )
-        )
-
-        source = {
-
-            "document_id":
-                metadata.get(
-                    "document_id"
-                ),
-
-            "filename":
-                metadata.get(
-                    "filename"
-                ),
-
-            "page":
-                metadata.get(
-                    "page_number"
-                ),
-
-            "score":
-                chunk.get(
-                    "score"
-                )
-
-        }
-
-        # --------------------------------------------------
-        # Avoid duplicate sources
-        # --------------------------------------------------
-
-        if source not in sources:
-
-            sources.append(
-                source
-            )
+    sources = deduplicate_grounded_sources(retrieved_chunks)
 
     # ==================================================
     # FINAL RESPONSE
     # ==================================================
+
+    llm_failure_prefixes = (
+        "Qwen did not return",
+        "Qwen returned",
+        "LLM API key",
+        "The request is too large",
+        "The LLM service is currently unavailable",
+    )
+    if (
+        conversation_id
+        and isinstance(answer, str)
+        and answer.strip()
+        and not answer.startswith(llm_failure_prefixes)
+    ):
+        store.add_message(
+            conversation_id,
+            "assistant",
+            answer,
+            {"sources": sources, "images_used": image_paths},
+        )
 
     return {
 
@@ -1431,6 +1582,9 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
         "document_id":
             selected_document_id
             or "auto",
+
+        "conversation_id":
+            conversation_id,
 
         "answer":
             answer,

@@ -14,6 +14,7 @@ from docling.document_converter import (
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling_core.types.doc import PictureItem
+from ai.extraction.diagram_describer import build_page_descriptions
 
 
 def extract_text(pdf_path, output_dir):
@@ -517,6 +518,14 @@ def extract_text(pdf_path, output_dir):
     # 6. Save visual manifest
     # --------------------------------------------------
 
+    page_descriptions = build_page_descriptions(visual_elements)
+    for visual in visual_elements:
+        page_number = visual.get("page_number")
+        for description in page_descriptions.get(page_number, []):
+            if description.get("visual_id") == visual.get("visual_id"):
+                visual["description"] = description["description"]
+                break
+
     visual_manifest_path = (
         document_dir
         / "visual_manifest.json"
@@ -563,7 +572,8 @@ def extract_text(pdf_path, output_dir):
                 "images": page_images.get(
                     page_number,
                     []
-                )
+                ),
+                "visual_descriptions": page_descriptions.get(page_number, []),
             }
         )
 
@@ -674,7 +684,10 @@ def extract_text(pdf_path, output_dir):
         "visual_elements": visual_elements,
 
         # Images grouped by page
-        "page_images": page_images,
+        "page_images":         page_images,
+
+        "page_descriptions":
+        page_descriptions,
 
         # Manifest
         "visual_manifest": str(

@@ -1,4 +1,9 @@
-def build_prompt(document_text, user_question, has_images=False):
+def build_prompt(
+    document_text,
+    user_question,
+    has_images=False,
+    conversation_history=None,
+):
 
     image_instruction = ""
 
@@ -21,6 +26,19 @@ that requires seeing the document image:
 
 If the user's question does NOT require the image, answer using the
 document text and do not use the image unnecessarily.
+"""
+
+    history_instruction = ""
+    if conversation_history:
+        history_lines = "\n".join(
+            f"{item.get('role', 'user').upper()}: {item.get('text', '')}"
+            for item in conversation_history
+            if item.get("text")
+        )
+        history_lines = history_lines[-6000:]
+        history_instruction = f"""
+RECENT CONVERSATION (use only to resolve references and follow-ups):
+{history_lines}
 """
 
     prompt = f"""
@@ -80,6 +98,7 @@ ANSWERING RULES:
 DOCUMENT CONTEXT:
 {document_text}
 
+{history_instruction}
 USER QUESTION:
 {user_question}
 

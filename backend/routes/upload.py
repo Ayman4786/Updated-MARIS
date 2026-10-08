@@ -5,25 +5,47 @@ from fastapi import File
 from pathlib import Path
 import uuid
 import json
+import hashlib
+from functools import wraps
 
 from ai.extraction.docling_extractor import extract_text
+from ai.extraction.diagram_describer import append_page_descriptions
 
 from ai.rag.chunker import RecursiveChunker
-from ai.rag.chunk_storage import save_chunks
+from ai.rag.chunk_storage import load_chunks, save_chunks
 from ai.rag.embeddings_service import EmbeddingsService
 from ai.rag.vector_store import VectorStoreManager
+from backend.persistence import (
+    CURRENT_UPLOAD_DOCUMENT,
+    DIAGRAM_ENRICHMENT_VERSION,
+    DOCUMENTS_ROOT,
+    MarisStore,
+)
 
 
 router = APIRouter()
+
+
+def _mark_failed_on_error(function):
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await function(*args, **kwargs)
+        except Exception as exc:
+            document_id = CURRENT_UPLOAD_DOCUMENT.get()
+            if document_id:
+                MarisStore().fail_document(document_id, str(exc))
+                CURRENT_UPLOAD_DOCUMENT.set(None)
+            raise
+
+    return wrapped
 
 
 # --------------------------------------------------
 # Main document storage
 # --------------------------------------------------
 
-DOCUMENT_DIR = Path(
-    "storage/documents"
-)
+DOCUMENT_DIR = DOCUMENTS_ROOT
 
 DOCUMENT_DIR.mkdir(
     parents=True,
@@ -32,18 +54,54 @@ DOCUMENT_DIR.mkdir(
 
 
 @router.post("/upload")
+@_mark_failed_on_error
 async def upload_pdf(
     file: UploadFile = File(...)
 ):
 
+    content = await file.read()
+    filename = Path(file.filename or "uploaded.pdf").name
+    content_hash = hashlib.sha256(content).hexdigest()
+    store = MarisStore()
+
+    document_id = (
+        f"{Path(filename).stem}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    action, existing = store.begin_document(content_hash, filename, document_id)
+    if action == "reuse" and existing:
+        chunks_path = Path(existing["document_folder"]) / "chunks.json"
+        enriched = False
+        if chunks_path.exists():
+            try:
+                cached_chunks = load_chunks(str(chunks_path))
+                enriched = bool(
+                    cached_chunks
+                    and cached_chunks[0].get("metadata", {}).get(
+                        "diagram_enrichment_version"
+                    )
+                    == DIAGRAM_ENRICHMENT_VERSION
+                )
+            except (OSError, ValueError, TypeError):
+                enriched = False
+        if enriched:
+            return {
+                "filename": existing["filename"],
+                "document_id": existing["document_id"],
+                "status": "success",
+                "reused": True,
+                "pages": existing["pages"],
+                "document_folder": existing["document_folder"],
+            }
+        store.mark_for_reprocessing(str(existing["document_id"]))
+        existing = store.get_document(str(existing["document_id"]))
+    if existing:
+        document_id = str(existing["document_id"])
+    CURRENT_UPLOAD_DOCUMENT.set(document_id)
+
     # ==================================================
     # 1. CREATE UNIQUE DOCUMENT ID
     # ==================================================
-
-    document_id = (
-        f"{Path(file.filename).stem}_"
-        f"{uuid.uuid4().hex[:8]}"
-    )
 
     # ==================================================
     # 2. CREATE DOCUMENT DIRECTORY
@@ -71,11 +129,7 @@ async def upload_pdf(
     # 3. SAVE PDF
     # ==================================================
 
-    pdf_path = (
-        document_dir / file.filename
-    )
-
-    content = await file.read()
+    pdf_path = document_dir / filename
 
     with open(
         pdf_path,
@@ -130,6 +184,11 @@ async def upload_pdf(
 
     page_images = extracted_data.get(
         "page_images",
+        {}
+    )
+
+    page_descriptions = extracted_data.get(
+        "page_descriptions",
         {}
     )
 
@@ -211,6 +270,12 @@ async def upload_pdf(
                 page_markdown
             )
         )
+
+        page_visual_descriptions = [
+            dict(item, document_id=document_id)
+            for item in page_descriptions.get(page_number, [])
+        ]
+        append_page_descriptions(page_chunks, page_visual_descriptions)
 
         print(
             f"Page {page_number}: "
@@ -311,7 +376,7 @@ async def upload_pdf(
 
                 # Original PDF name
                 "filename":
-                    file.filename,
+                    filename,
 
                 # Chunk identity
                 "chunk_id":
@@ -335,7 +400,16 @@ async def upload_pdf(
 
                 # JSON string for ChromaDB primitive compatibility
                 "image_paths_json":
-                    json.dumps(chunk_image_paths)
+                    json.dumps(chunk_image_paths),
+
+                "visual_descriptions":
+                    page_visual_descriptions,
+
+                "visual_descriptions_json":
+                    json.dumps(page_visual_descriptions),
+
+                "diagram_enrichment_version":
+                    DIAGRAM_ENRICHMENT_VERSION,
             }
 
             if chunk_image_paths:
@@ -484,10 +558,12 @@ async def upload_pdf(
     # 13. RETURN RESULT
     # ==================================================
 
+    store.complete_document(document_id, len(pages))
+    CURRENT_UPLOAD_DOCUMENT.set(None)
     return {
 
         "filename":
-            file.filename,
+            filename,
 
         "document_id":
             document_id,

@@ -3,8 +3,35 @@ from typing import Any
 import streamlit as st
 
 
+def deduplicate_display_sources(
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep the highest-scoring source for each document/page pair."""
+    by_page: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for source in sources:
+        key = (source.get("document_id"), source.get("page"))
+        existing = by_page.get(key)
+        if existing is None:
+            by_page[key] = source
+            continue
+        score = source.get("score")
+        existing_score = existing.get("score")
+        if (
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and (
+                not isinstance(existing_score, (int, float))
+                or isinstance(existing_score, bool)
+                or score > existing_score
+            )
+        ):
+            by_page[key] = source
+    return list(by_page.values())
+
+
 def render_sources(sources: list[dict[str, Any]]) -> int | None:
     st.subheader("Grounded Sources")
+    sources = deduplicate_display_sources(sources)
     if not sources:
         st.caption("No source pages were returned for this answer.")
         return None
@@ -22,7 +49,9 @@ def render_sources(sources: list[dict[str, Any]]) -> int | None:
             f"Relevance: {score_label}"
         )
         if isinstance(page, int) and page > 0:
-            page_options.append((f"Page {page} - {filename}", page))
+            document_id = source.get("document_id")
+            suffix = f" ({document_id})" if document_id else ""
+            page_options.append((f"Page {page} - {filename}{suffix}", page))
 
     if not page_options:
         return None

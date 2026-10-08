@@ -10,6 +10,8 @@ The current application has a Streamlit user interface and a FastAPI backend. A 
 - Recursive page-level text chunking with source page and document metadata.
 - Text embeddings from `BAAI/bge-small-en-v1.5`.
 - Persistent ChromaDB storage and hybrid retrieval using vector similarity plus BM25 lexical scoring.
+- SQLite document registry keyed by PDF SHA-256, with retry-safe processing status and cache reuse.
+- Persistent per-document conversations and bounded follow-up context across app restarts.
 - Visual intent detection based on explicit phrases and visual object/action keywords.
 - Visual candidate collection from retrieved chunks and relevant pages.
 - Conservative visual-noise filtering, CLIP ranking, and Qwen verification.
@@ -19,7 +21,7 @@ The current application has a Streamlit user interface and a FastAPI backend. A 
 
 ## Architecture And Workflow
 
-The backend has two registered routes: `POST /upload` indexes a PDF, and `POST /chat` retrieves context and generates an answer. The root route `GET /` is a simple server health response. The `session.py` and `highlight.py` files exist in `backend/routes`, but they are not included by `backend/main.py` and therefore do not expose routes in the running application.
+The backend exposes upload, chat, document-library, PDF-download, and conversation routes. `storage/maris.db` contains metadata and chat messages; PDFs, extracted artifacts, images, and embeddings remain in their existing storage locations.
 
 ### End-to-end flow
 
@@ -32,7 +34,7 @@ flowchart TD
     I --> C[Page-aware chunking]
     C --> E[Text embeddings]
     E --> V[ChromaDB indexing]
-    S -->|POST /chat with question and document_id| F
+    S -->|POST /chat with question, document_id, conversation_id| F
     F --> R[Hybrid text retrieval]
     R --> G[Context and prompt building]
     G --> L[Groq Qwen answer generation]
@@ -40,7 +42,7 @@ flowchart TD
     S --> O[Answer, sources, and PDF reader]
 ```
 
-Upload processing saves each document under `storage/documents/<document_id>/`, writes Markdown and manifests, embeds the chunks, and upserts them into the persistent `storage/chroma_db` collection named `pdf_chunks`.
+Upload processing hashes the bytes before extraction. A successful matching hash returns the existing document ID without rerunning Docling, chunking, or embeddings. New documents are saved under `storage/documents/<document_id>/`, while chunks are upserted into the persistent `storage/chroma_db` collection named `pdf_chunks`.
 
 ### Visual-question flow
 
@@ -79,12 +81,19 @@ Text-only questions still perform text retrieval and context construction, but b
 
 - `frontend/app.py` owns the page, Streamlit session state, PDF validation, upload lifecycle, chat submission, answer display, source display, and PDF reader layout.
 - `frontend/api/client.py` provides `MarisClient`, which calls `POST /upload` and `POST /chat`, parses JSON, and reports backend/network errors.
-- `frontend/components/chat_panel.py` renders the sidebar question form, chat history, and clear-chat action.
+- `frontend/components/chat_panel.py` renders the question form and retains a compatibility wrapper for the original panel.
 - `frontend/components/source_panel.py` renders filename, page, and relevance score information and lets the user select a source page.
 - `frontend/components/pdf_viewer.py` displays the uploaded PDF with Streamlit's native PDF component when available, or an embedded base64 PDF iframe when a source page is selected or the native component is unavailable.
 - `frontend/utils/config.py` reads the optional `MARIS_BACKEND_URL`, defaulting to `http://127.0.0.1:8000`.
 
-The user selects one PDF in the uploader. The frontend rejects files that do not have a `.pdf` suffix or `%PDF` header, sends valid files to the backend, stores the returned `document_id`, and enables the question form only after successful indexing. Answers and source records are displayed beside the PDF reader; selecting a source page changes the PDF view to that page.
+The three-column frontend provides a persistent document library on the left, the PDF reader and chat in the center, and document-scoped chat history on the right. Selecting an existing document downloads its stored PDF; selecting a conversation restores its messages. Deleting a conversation cascades only its messages and never its document or Chroma entries.
+
+## Persistence and configuration
+
+- `MARIS_STORAGE_DIR` optionally changes the storage root (default: `storage`).
+- `MARIS_CONTEXT_MESSAGE_LIMIT` controls the number of recent messages placed in follow-up prompts (default: `8`).
+- `storage/maris.db` is created and migrated automatically. Existing document folders are discovered on startup and registered without changing their IDs.
+- SQLite stores document metadata, conversation records, source metadata, and image metadata; it does not duplicate PDFs, extracted Markdown, images, or embeddings.
 
 ## Repository Structure
 
@@ -211,6 +220,21 @@ Streamlit prints the local application URL, normally `http://localhost:8501`. Op
 
 The first indexing or visual-ranking request may download or initialize the configured Docling, embedding, or CLIP model files, so processing time and memory use depend on the document and local environment.
 
+### Diagram-aware indexing
+
+During PDF extraction, sufficiently large diagrams, charts, tables, and figures
+reuse Docling captions when available. Otherwise MARIS makes an optional,
+failure-tolerant call to the existing Qwen/Groq vision client to produce a
+concise description of visible titles, labels, components, and flows. Tiny
+decorative visuals and repeated logo occurrences are skipped. Descriptions are
+stored with visual/page metadata and appended only to the first chunk of their
+source page before embedding, without changing the original Markdown or image
+files. Captioning failures do not fail an upload.
+
+Chunks carry a diagram-enrichment version marker. A successful cached document
+whose chunks predate this marker is reprocessed once, preventing stale
+non-enriched chunks from being silently reused.
+
 ## API Reference
 
 ### `GET /`
@@ -223,7 +247,7 @@ Returns:
 
 ### `POST /upload`
 
-Accepts a multipart form upload with a required field named `file`. The field should contain a PDF. The route creates a generated document ID, extracts the document, writes its artifacts, creates embeddings, and stores chunks in ChromaDB.
+Accepts a multipart form upload with a required field named `file`. The route hashes the PDF first and either reuses a successful registry entry or creates/processes a new document. A cache hit includes `reused: true`.
 
 Successful responses include:
 
@@ -247,21 +271,23 @@ The numeric values and preview depend on the uploaded PDF.
 
 ### `POST /chat`
 
-Accepts JSON with a required `question` string and an optional `document_id` string:
+Accepts JSON with a required `question` string and optional `document_id` and `conversation_id` strings:
 
 ```json
 {
   "question": "What is the main purpose of this system?",
-  "document_id": "document_<random-id>"
+  "document_id": "document_<random-id>",
+  "conversation_id": "conversation-id"
 }
 ```
 
-When `document_id` is omitted, the route searches all uploaded document directories. The normal response contains:
+For a document-scoped conversation, the backend stores the user message, includes only the configured number of recent messages in the existing prompt, and stores the assistant answer after successful generation. When `document_id` is omitted, the route searches all uploaded document directories. The normal response contains:
 
 ```json
 {
   "question": "...",
   "document_id": "...",
+  "conversation_id": "...",
   "answer": "...",
   "sources": [
     {
@@ -279,13 +305,13 @@ For a visual question, `images_used` contains the selected image path when a can
 
 ## Testing And Current Status
 
-The focused visual-layer suite is run with:
+The focused persistence and visual-layer suite is run with:
 
 ```bash
-python -m unittest tests/test_layer1_deduplication.py tests/test_layer2_grouping.py tests/test_layer3_verification.py
+python -m pytest tests/test_persistence.py tests/test_layer1_deduplication.py tests/test_layer2_grouping.py tests/test_layer3_verification.py tests/test_context_builder.py
 ```
 
-In the current checkout, these Layer 1, Layer 2, and Layer 3 tests pass together. They cover MD5 deduplication and occurrence metadata, spatial grouping and PDF-region reconstruction, and Layer 3 selection and fallback behavior.
+In this checkout, that command passes 11 tests. It covers hash-based document reuse and retry behavior, conversation persistence and prompt context, MD5 visual deduplication and occurrence metadata, spatial grouping and PDF-region reconstruction, and Layer 3 selection and fallback behavior.
 
 The broader test set can be attempted with:
 
@@ -293,7 +319,7 @@ The broader test set can be attempted with:
 python -m unittest discover -s tests -p "test*.py"
 ```
 
-In the current checkout, discovery ran 10 tests and reported 4 errors. The errors include a missing legacy output directory for `test_chunk_storage.py`, missing `torch` and `fastapi` packages in the active interpreter, and the legacy full-RAG fixture path `storage/extracted_docs/CC_test.md`. Check the test output in the environment where they are run rather than treating this broader suite as proof of end-to-end accuracy.
+In this checkout, the full pytest collection is blocked by pre-existing legacy fixture paths (`storage/extracted_docs/CC_test.md` and `storage/chunked_docs/test.json`) and transformer/PyTorch initialization errors in the legacy embedding tests. These are outside the persistence and UI changes; use the focused command above to validate this work.
 
 The tested SIH.pdf example successfully reconstructed architecture diagrams and answered architecture-related visual questions. A process-flow question has also previously selected an unrelated visual even when its text-based answer was correct. Visual retrieval is therefore implemented and tested in focused areas, but it is not perfect or universally accurate.
 

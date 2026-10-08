@@ -106,7 +106,7 @@ class TestLayer3Verification(unittest.IsolatedAsyncioTestCase):
         c2 = {"image_path": str(self.mock_image), "score": 0.8, "type": "picture", "id": "loser"}
         mock_rank.return_value = ([str(self.mock_image), str(self.mock_image)], [c1, c2])
         
-        # Simulate verification throwing error for both
+        # Invalid verification responses are hard rejection, not a fallback.
         mock_gen_answer.side_effect = [
             "invalid json format 1",
             "invalid json format 2",
@@ -116,9 +116,7 @@ class TestLayer3Verification(unittest.IsolatedAsyncioTestCase):
         req = QuestionRequest(question="Explain the diagram")
         result = await chat(req)
 
-        # Should fallback and use the image with the highest original CLIP score (c1)
-        self.assertEqual(len(result["images_used"]), 1)
-        self.assertEqual(result["images_used"][0], str(self.mock_image))
+        self.assertEqual(result["images_used"], [])
         
     @patch("backend.routes.chat.generate_answer")
     @patch("backend.routes.chat.rank_visual_candidates")
