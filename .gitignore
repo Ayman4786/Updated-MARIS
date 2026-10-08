@@ -61,6 +61,7 @@ storage/images/
 storage/extracted_docs/
 storage/uploaded_pdfs/
 storage/documents/
+storage/maris.db
 
 # ==============================
 # Local Vector / Database Files
