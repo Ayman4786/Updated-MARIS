@@ -68,6 +68,29 @@ def test_conversation_and_messages_survive_reopening(tmp_path):
     assert reopened.get_document("chat_a1")["status"] == "success"
 
 
+def test_conversation_rename_persists_and_recent_chats_are_first(tmp_path):
+    database = tmp_path / "maris.db"
+    store = MarisStore(database)
+    digest = hashlib.sha256(b"%PDF-rename").hexdigest()
+    store.begin_document(digest, "rename.pdf", "rename_a1")
+    store.complete_document("rename_a1", 1)
+
+    first = store.create_conversation("rename_a1")
+    second = store.create_conversation("rename_a1")
+    renamed = store.rename_conversation(first["conversation_id"], "Architecture Diagram")
+
+    assert renamed["title"] == "Architecture Diagram"
+    reopened = MarisStore(database)
+    assert reopened.get_conversation(first["conversation_id"])["title"] == (
+        "Architecture Diagram"
+    )
+    listed = reopened.list_conversations("rename_a1")
+    assert [item["conversation_id"] for item in listed] == [
+        second["conversation_id"],
+        first["conversation_id"],
+    ]
+
+
 def test_prompt_contains_only_bounded_follow_up_context():
     prompt = build_prompt(
         "The document context.",

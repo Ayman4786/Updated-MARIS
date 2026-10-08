@@ -95,6 +95,13 @@ class MarisClient:
             raise BackendError("Could not delete conversation.") from exc
         return self._parse_response(response, "Could not delete conversation")
 
+    def rename_conversation(self, conversation_id: str, title: str) -> dict[str, Any]:
+        return self._patch_json(
+            f"/conversations/{conversation_id}",
+            {"title": title},
+            "Could not rename conversation",
+        )
+
     def _get_json(
         self, path: str, failure_message: str, params: dict[str, Any] | None = None
     ) -> Any:
@@ -109,6 +116,15 @@ class MarisClient:
     def _post_json(self, path: str, payload: dict[str, Any], failure_message: str) -> Any:
         try:
             response = requests.post(
+                f"{self.base_url}{path}", json=payload, timeout=60
+            )
+        except requests.RequestException as exc:
+            raise BackendError(failure_message) from exc
+        return self._parse_response(response, failure_message)
+
+    def _patch_json(self, path: str, payload: dict[str, Any], failure_message: str) -> Any:
+        try:
+            response = requests.patch(
                 f"{self.base_url}{path}", json=payload, timeout=60
             )
         except requests.RequestException as exc:

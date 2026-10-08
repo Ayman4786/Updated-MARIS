@@ -17,6 +17,10 @@ class ConversationRequest(BaseModel):
     title: str = "New chat"
 
 
+class ConversationRenameRequest(BaseModel):
+    title: str
+
+
 @router.get("/documents")
 def documents() -> list[dict[str, Any]]:
     return store.list_documents()
@@ -73,3 +77,13 @@ def delete_conversation(conversation_id: str) -> dict[str, bool]:
     if not store.delete_conversation(conversation_id):
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"deleted": True}
+
+
+@router.patch("/conversations/{conversation_id}")
+def rename_conversation(
+    conversation_id: str, request: ConversationRenameRequest
+) -> dict[str, Any]:
+    renamed = store.rename_conversation(conversation_id, request.title)
+    if not renamed:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return renamed

@@ -257,6 +257,15 @@ class MarisStore:
             )
         return result.rowcount > 0
 
+    def rename_conversation(self, conversation_id: str, title: str) -> dict[str, Any] | None:
+        clean_title = title.strip().replace("\n", " ")[:200] or "New chat"
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE conversations SET title=? WHERE conversation_id=?",
+                (clean_title, conversation_id),
+            )
+        return self.get_conversation(conversation_id)
+
     def add_message(
         self,
         conversation_id: str,
