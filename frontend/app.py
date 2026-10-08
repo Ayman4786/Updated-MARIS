@@ -1,6 +1,6 @@
-from typing import Any
-
 import hashlib
+import html
+from typing import Any
 
 import streamlit as st
 
@@ -181,6 +181,34 @@ st.markdown(
         letter-spacing: .12em;
     }
 
+    .maris-web-source {
+        margin-top: .45rem;
+        padding: .55rem .65rem;
+        border: 1px solid #26324a;
+        border-radius: 8px;
+        background: #0d1526;
+        color: #b8c7df;
+        font-size: .78rem;
+        line-height: 1.35;
+    }
+
+    .maris-web-source a {
+        color: #8fc2ff;
+        font-weight: 600;
+        text-decoration: none;
+    }
+
+    .maris-web-source a:hover {
+        text-decoration: underline;
+    }
+
+    .maris-web-source-url {
+        margin: .15rem 0 .3rem;
+        color: #7186a7;
+        font-size: .7rem;
+        overflow-wrap: anywhere;
+    }
+
     /* ========================================================
        BUTTONS
        ======================================================== */
@@ -293,6 +321,7 @@ def initialize_state() -> None:
         "page_count": None,
         "messages": [],
         "sources": [],
+        "web_search": False,
         "selected_source_page": None,
         "upload_signature": None,
         "upload_error_signature": None,
@@ -700,6 +729,53 @@ def render_chat_messages() -> None:
                         message["text"]
                     )
 
+                    if message["role"] != "assistant":
+                        continue
+
+                    metadata = message.get("metadata", {})
+                    web_sources = metadata.get("web_sources", [])
+                    if not isinstance(web_sources, list) or not web_sources:
+                        continue
+
+                    st.markdown(
+                        '<div class="maris-eyebrow" '
+                        'style="margin-top:.65rem;">WEB SOURCES</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    for source in web_sources:
+                        if not isinstance(source, dict):
+                            continue
+
+                        title = source.get("title") or source.get("url")
+                        url = source.get("url")
+                        snippet = source.get("snippet")
+                        if not isinstance(title, str) or not isinstance(url, str):
+                            continue
+
+                        safe_title = html.escape(title)
+                        safe_url = html.escape(url, quote=True)
+                        safe_snippet = (
+                            html.escape(snippet)
+                            if isinstance(snippet, str) and snippet
+                            else ""
+                        )
+                        snippet_html = (
+                            f"<div>{safe_snippet}</div>"
+                            if safe_snippet
+                            else ""
+                        )
+
+                        st.markdown(
+                            f'<div class="maris-web-source">'
+                            f'<a href="{safe_url}" target="_blank" '
+                            f'rel="noopener noreferrer">{safe_title}</a>'
+                            f'<div class="maris-web-source-url">{safe_url}</div>'
+                            f"{snippet_html}"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
 
 # ============================================================
 # RIGHT — QUESTION / CHAT PROCESSING
@@ -730,6 +806,13 @@ def render_question_and_messages(
         unsafe_allow_html=True,
     )
 
+    st.toggle(
+        "Web Search",
+        key="web_search",
+        disabled=not st.session_state.document_id,
+        help="Include current external web results with the document-grounded answer.",
+    )
+
     question = render_question_form(
         bool(st.session_state.document_id)
     )
@@ -747,6 +830,7 @@ def render_question_and_messages(
                 question,
                 st.session_state.document_id,
                 st.session_state.conversation_id,
+                st.session_state.web_search,
             )
 
     except BackendError as exc:
@@ -788,6 +872,10 @@ def render_question_and_messages(
                     ),
                     "images_used": response.get(
                         "images_used",
+                        [],
+                    ),
+                    "web_sources": response.get(
+                        "web_sources",
                         [],
                     ),
                 },

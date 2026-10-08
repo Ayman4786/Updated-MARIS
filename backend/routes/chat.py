@@ -15,6 +15,7 @@ from ai.rag.visual_rag import VisualRAG
 from ai.llm.prompt_builder import build_prompt
 from ai.llm.llm_service import generate_answer
 from backend.persistence import DOCUMENTS_ROOT, MarisStore
+from backend.services.serpapi import WebSearchError, search_web
 
 
 router = APIRouter()
@@ -54,6 +55,7 @@ class QuestionRequest(BaseModel):
 
     document_id: str | None = None
     conversation_id: str | None = None
+    web_search: bool = False
 
 
 # ==================================================
@@ -1152,6 +1154,14 @@ async def chat(
         )
     )
 
+    web_sources: list[dict[str, str]] = []
+    web_search_error: str | None = None
+    if getattr(request, "web_search", False):
+        try:
+            web_sources = search_web(request.question)
+        except WebSearchError as exc:
+            web_search_error = str(exc)
+
     # ==================================================
     # DETERMINE VISUAL INTENT
     # ==================================================
@@ -1503,7 +1513,10 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
             bool(image_paths),
 
         conversation_history=
-            prior_messages
+            prior_messages,
+
+        web_results=
+            web_sources
 
     )
 
@@ -1571,7 +1584,11 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
             conversation_id,
             "assistant",
             answer,
-            {"sources": sources, "images_used": image_paths},
+            {
+                "sources": sources,
+                "images_used": image_paths,
+                "web_sources": web_sources,
+            },
         )
 
     return {
@@ -1593,6 +1610,11 @@ Respond STRICTLY with valid JSON only, no markdown, no backticks.
             sources,
 
         "images_used":
-            image_paths
+            image_paths,
+
+        "web_sources":
+            web_sources,
+
+        **({"web_search_error": web_search_error} if web_search_error else {})
 
     }

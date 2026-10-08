@@ -35,6 +35,7 @@ class MarisClient:
         question: str,
         document_id: str,
         conversation_id: str | None,
+        web_search: bool = False,
     ) -> dict[str, Any]:
         try:
             response = requests.post(
@@ -43,6 +44,7 @@ class MarisClient:
                     "question": question,
                     "document_id": document_id,
                     "conversation_id": conversation_id,
+                    "web_search": web_search,
                 },
                 timeout=300,
             )
